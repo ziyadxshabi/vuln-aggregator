@@ -1,0 +1,656 @@
+NOOB.READ
+Unified Vulnerability Aggregation & Prioritization Platform
+A plain-English walkthrough for someone new to Python, networking, and cybersecurity
+
+
+================================================================
+0. READ THIS FIRST
+================================================================
+
+This project is a small software system that answers one practical question:
+
+  "What is broken or insecure on my computers and network, and what should I
+   fix first?"
+
+Security teams use scanners to hunt for weaknesses (called vulnerabilities).
+The problem is that you often have more than one scanner, they all speak
+different "languages", and they dump hundreds of findings on you.
+
+This platform:
+
+  1. Asks two scanners (Greenbone/OpenVAS and Nessus) to scan the same targets
+  2. Translates their different reports into one common format
+  3. Looks up extra intel (is there a public exploit? how likely is it to be
+     used in the wild?)
+  4. Gives each finding a risk score from 0 to 10
+  5. Saves everything in a database
+  6. Lets you browse results in a web dashboard and a REST API
+
+You do not need to be a security expert to understand the idea. Think of it
+like two different doctors examining the same patient, a specialist adding
+notes, and then a nurse ranking which symptoms to treat first.
+
+
+================================================================
+1. THE REAL-WORLD PROBLEM (WHY THIS EXISTS)
+================================================================
+
+Imagine you own a house.
+
+  - One inspector checks the doors and windows (scanner A).
+  - Another inspector checks the electrical wiring (scanner B).
+  - A public database lists which house problems burglars actually exploit
+    (threat intel).
+
+If you just pile both inspector reports on the kitchen table, you get:
+
+  - Duplicate notes ("front door lock is weak" appears twice)
+  - Different wording for the same issue
+  - No ranking of "fix this tonight" vs "fix this next month"
+
+This project is the person who:
+
+  - Sends both inspectors out at the same time
+  - Rewrites every note onto the same form
+  - Cross-checks a public "burglar playbook"
+  - Circles the most urgent items
+  - Files the forms in a cabinet you can search later
+
+
+================================================================
+2. CYBERSECURITY WORDS YOU WILL SEE EVERYWHERE
+================================================================
+
+These words show up in the code. Learn them once and the rest of the project
+gets much easier.
+
+VULNERABILITY
+  A weakness that an attacker could abuse.
+  Example: an old version of software with a known bug, a service with a
+  default password, an unpatched Windows machine.
+
+CVE (Common Vulnerabilities and Exposures)
+  A public ID for a known vulnerability, like CVE-2021-44228.
+  Think of it as a catalog number. If two scanners both say "CVE-2021-44228",
+  they are talking about the same published weakness.
+
+SCANNER
+  A program that looks at computers / IP addresses and reports weaknesses.
+  This project talks to two:
+    - GVM / OpenVAS / Greenbone  (open-source scanner)
+    - Nessus                     (commercial scanner from Tenable)
+
+TARGET
+  What you want scanned. It can be:
+    - One computer:        192.168.1.10
+    - A whole neighborhood of IPs:  192.168.1.0/24
+    - A website name:      example.com
+  The list lives in the .env file as SCAN_TARGETS.
+
+ASSET
+  The thing that has the vulnerability: a host name, an IP address, maybe
+  an operating system. In this code you will see asset_host and asset_ip.
+
+PORT
+  A numbered "door" on a computer. Websites often use port 80 or 443.
+  SSH (remote login) often uses port 22. A vulnerability is often tied to
+  "this IP, this port, this service".
+
+PROTOCOL
+  The language used on that port, usually tcp or udp. You can think of TCP
+  as a phone call that stays connected, and UDP as sending postcards.
+
+SEVERITY
+  A simple label: Low, Medium, High, Critical.
+  Scanners assign this. It is a first guess, not the final ranking this
+  project uses.
+
+CVSS (Common Vulnerability Scoring System)
+  A number from 0 to 10 that describes how bad a CVE is in theory.
+  There are versions: CVSS v2 (older) and CVSS v3 (newer, preferred here).
+  Example: 9.8 is almost as bad as it gets.
+
+EPSS (Exploit Prediction Scoring System)
+  A number from 0.0 to 1.0 that estimates the chance this CVE will be
+  exploited in the wild soon. High CVSS + high EPSS is extra scary:
+  "this is bad AND attackers actually use it".
+
+EXPLOIT
+  Working attack code / a known method to abuse the vulnerability.
+  If exploit_available is True, someone has published a way to use it.
+  That raises urgency even if the CVSS is only medium.
+
+RISK SCORE (this project's own number)
+  A 0-10 score this app computes. It mixes CVSS, EPSS, exploit availability,
+  and (optionally) how important the machine is.
+  The dashboard sorts by this so you fix the worst things first.
+
+FINDING
+  One row of "we found this weakness on this machine".
+  One scan of a network can produce hundreds of findings.
+
+THREAT INTELLIGENCE
+  Extra facts from outside your network. Here that source is Vulners:
+  "does this CVE have exploits? what is the EPSS? any extra references?"
+
+
+================================================================
+3. NETWORKING IN 2 MINUTES (ENOUGH TO READ THIS CODE)
+================================================================
+
+Computers on a network have addresses, like houses have street numbers.
+
+IP ADDRESS
+  Example: 192.168.1.15
+  That is a private address, typically used inside a home or office LAN
+  (Local Area Network). It is not the public address of the whole internet.
+
+CIDR / SUBNET  (the "/24" you see)
+  192.168.1.0/24 means "all addresses from 192.168.1.0 to 192.168.1.255".
+  Scanning a subnet means "check this whole office floor", not one PC.
+
+HOSTNAME
+  A human name, like fileserver.office.local or example.com.
+  DNS turns that name into an IP address.
+
+SCANNING
+  The scanner connects to the target, looks at open ports and software
+  versions, and compares them to a database of known problems.
+  This is normal defensive work on systems you own or have permission to
+  test. Scanning other people's networks without permission is illegal.
+
+API (Application Programming Interface)
+  A way for programs to talk to each other over HTTP, like a website but
+  for machines. You send a request, you get data back (usually JSON).
+
+  This project:
+    - CALLS APIs of GVM, Nessus, and Vulners
+    - PROVIDES its own API so the dashboard (or you) can start scans and
+      read findings
+
+REST API
+  A common style of HTTP API. You will see:
+    POST /scans              start a scan
+    GET  /findings           list findings
+    GET  /findings/{id}      one finding
+  GET means "read". POST means "do something / send data".
+
+JSON
+  A text format that looks like:
+    { "cve_id": "CVE-2021-44228", "severity": "Critical" }
+  Computers love it. Humans can still read it.
+
+
+================================================================
+4. PYTHON IDEAS USED IN THIS PROJECT (BEGINNER LEVEL)
+================================================================
+
+You do not need to be fluent in Python. These are the pieces this repo uses.
+
+FILE = MODULE
+  config.py is a Python file. Other files can "import" things from it.
+  Example: from src.config import settings
+
+FOLDER WITH __init__.py = PACKAGE
+  src/, src/connectors/, src/api/, src/utils/ are packages.
+  The empty __init__.py files tell Python "this folder is importable code,
+  not just a pile of documents".
+
+CLASS
+  A blueprint. GVMConnector is a class. When the program does
+  GVMConnector(), it creates one object that knows how to talk to GVM.
+
+ASYNC / AWAIT / asyncio
+  Normal Python does one thing, then the next.
+  Scanning is mostly waiting: "I asked Nessus to scan, now I wait".
+  Async lets Python start several waits at once (GVM and Nessus together)
+  instead of sitting idle. You will see async def and await everywhere.
+  You do not need to master it to follow the story.
+
+ENVIRONMENT VARIABLES / .env
+  Secrets and settings (passwords, API keys, host names) should not be
+  hard-coded in the Python files. They live in a file named .env.
+  src/config.py reads that file when the app starts.
+
+DOCKER
+  A way to run the app in isolated boxes called containers, so you do not
+  have to install PostgreSQL, Redis, Python packages, etc. by hand on
+  Windows. docker-compose.yml describes several boxes that start together.
+
+POSTGRESQL
+  A database. Think of a spreadsheet that programs can query.
+  Findings are stored in a table named "vulnerabilities".
+
+UPSERT
+  "Update if this row already exists, insert if it is new."
+  Recurring scans should refresh the same finding, not create a duplicate
+  row every 6 hours.
+
+
+================================================================
+5. THE BIG PICTURE: HOW A SCAN FLOWS
+================================================================
+
+Here is the full journey of one scan, in order.
+
+STEP A. Someone (or the clock) says "scan these targets"
+  Sources:
+    - You click "Trigger New Scan" on the dashboard
+    - You POST to /scans on the API
+    - The scheduler wakes up every SCAN_SCHEDULE_HOURS hours (default 6)
+
+STEP B. The Orchestrator takes over  (src/orchestrator.py)
+  This is the project manager.
+  For every target, it starts TWO scans at the same time:
+    - GVMConnector.scan_target(target)
+    - NessusConnector.scan_target(target)
+  asyncio.gather waits until both finish (or fail). If one scanner crashes,
+  the other scanner's results are still kept.
+
+STEP C. Each connector talks to its scanner
+  GVM:
+    login -> create a target -> create a task -> start task -> poll until
+    done (max 2 hours) -> download XML report -> turn XML into Vulnerability
+    objects
+
+  Nessus:
+    create a scan -> launch it -> poll until completed (max 1 hour) ->
+    fetch details -> turn JSON into Vulnerability objects
+
+  Both connectors output the SAME Python object type: Vulnerability.
+  That translation is called "normalization". Without it, you would have
+  two incompatible report formats forever.
+
+STEP D. Enrichment via Vulners  (src/connectors/vulners_connector.py)
+  For every finding that has a CVE ID, the orchestrator asks Vulners:
+    - Are there known exploits?
+    - What is the EPSS score?
+    - Extra references / better CVSS numbers
+  Findings without a CVE skip this step.
+
+STEP E. Risk score  (src/risk_engine.py)
+  Each finding gets a number 0-10:
+    - 50% from CVSS (prefer v3, else v2, else a guess from Low/Medium/High)
+    - 30% from EPSS
+    - +1.5 if an exploit exists
+    - then multiplied by asset_criticality (currently always 1.0)
+  The score is capped at 10.
+
+STEP F. Deduplicate this batch
+  If the same scanner, plugin/vuln id, IP, and port appear twice in one
+  run, keep the copy with the higher risk score.
+
+STEP G. Save to PostgreSQL
+  Each finding gets a stable ID (a short hash of scanner + vuln id + IP +
+  port). If that ID already exists from a previous scan, the row is UPDATED
+  (new score, new timestamp, new exploit info). If it is new, it is INSERTED.
+  That is why rerunning scans does not flood the table with clones.
+
+STEP H. You look at the results
+  - Dashboard: http://localhost:8501  (charts, top 10, trigger scan)
+  - API docs:  http://localhost:8000/docs  (interactive "try it" page)
+  - GET /findings returns the worst findings first (highest risk_score)
+
+
+================================================================
+6. FOLDER TOUR (WHAT EACH FILE IS FOR)
+================================================================
+
+vuln_aggregator/
+|
+|-- .env / .env.example
+|     Your secrets and settings. .env.example is a template you can copy.
+|     Never publish a real .env (passwords live there). .gitignore already
+|     tells git to ignore .env.
+|
+|-- docker-compose.yml
+|     The "start the whole factory" file. It boots:
+|       postgres   = the database
+|       redis      = optional cache (configured, not heavily used yet)
+|       api        = FastAPI web service
+|       scheduler  = automatic repeating scans
+|       dashboard  = Streamlit website
+|
+|-- Dockerfile
+|     Recipe for building the API / scheduler Python image.
+|
+|-- requirements.txt
+|     List of Python libraries the backend needs (FastAPI, SQLAlchemy, ...).
+|
+|-- README.md
+|     Short official overview and how to run Docker.
+|
+|-- noob.read
+|     This file. The long beginner explanation.
+|
+|-- src/                         THE BRAIN
+|   |-- config.py                Reads .env into a Settings object
+|   |-- models.py                The common "Vulnerability" form + ID helper
+|   |-- database.py              PostgreSQL table definition and connection
+|   |-- orchestrator.py          The project manager (scan, enrich, store)
+|   |-- risk_engine.py           The 0-10 scoring formula
+|   |-- scheduler.py             Alarm clock: scan every N hours
+|   |
+|   |-- connectors/              TRANSLATORS TO OUTSIDE TOOLS
+|   |     base.py                The contract every scanner must follow
+|   |     gvm_connector.py       Talks to Greenbone / OpenVAS
+|   |     nessus_connector.py    Talks to Nessus
+|   |     vulners_connector.py   Talks to Vulners threat intel
+|   |
+|   |-- api/                     THE DOOR TO THE OUTSIDE WORLD
+|   |     main.py                Starts FastAPI, creates DB tables on boot
+|   |     routes.py              The actual URLs: /scans and /findings
+|   |
+|   |-- utils/
+|         logging.py             Structured JSON logs
+|
+|-- dashboard/
+|     app.py                     Streamlit UI (metrics, charts, button)
+|     Dockerfile / requirements.txt
+|
+|-- tests/
+      Empty package for future tests.
+
+
+================================================================
+7. THE COMMON FORM: WHAT A "VULNERABILITY" RECORD HOLDS
+================================================================
+
+Every finding, no matter which scanner found it, is squeezed into this
+shape (src/models.py). That is the whole point of "unified".
+
+  id                 Fingerprint so the same issue stays one row
+  cve_id             Public catalog number, if known
+  scanner            "gvm" or "nessus"
+  scanner_vuln_id    That scanner's own ID for the check (plugin / NVT)
+  asset_host         Hostname you asked to scan
+  asset_ip           IP where it was found
+  asset_os           Operating system, if known
+  port / protocol    Which door, and TCP or UDP
+  description        Human-readable "what is wrong"
+  cvss_v2_score
+  cvss_v3_score      How bad it is on the 0-10 CVSS scale
+  severity           Low / Medium / High / Critical
+  solution           How to fix it (patch, config change, ...)
+  exploit_available  True if public exploit intel exists
+  epss_score         Likelihood of real-world exploitation
+  references         Links
+  risk_score         THIS app's 0-10 priority number
+  scan_timestamp     When we last saw it
+  tags               Extra labels (mostly unused for now)
+
+THE STABLE ID
+  generate_vuln_id() hashes:
+      scanner + scanner_vuln_id + asset_ip + port
+  Same inputs always produce the same id. That is how upserts work.
+
+  Example meaning: "Nessus plugin 12345 on 192.168.1.10 port 443" is always
+  the same finding, even if you scan again tomorrow.
+
+
+================================================================
+8. CONNECTORS: WHY THEY EXIST
+================================================================
+
+GVM and Nessus are different products.
+
+  - GVM speaks GMP and returns XML.
+  - Nessus speaks HTTP JSON (via the nessrest library).
+  - Vulners is not a scanner; it is a lookup service for CVE intel.
+
+If the rest of the app had to know XML vs JSON, the orchestrator would
+become a mess. So each connector hides the ugly details.
+
+base.py says: "If you want to be a scanner here, you MUST implement
+scan_target() and fetch_results() and return a list of Vulnerability."
+
+That is an interface / contract. Later you could add Qualys or Rapid7 by
+writing one new connector file, without rewriting the dashboard.
+
+GVM POLLING
+  After you start a GVM task, it does not finish instantly. The code sleeps
+  10 seconds, asks "are you done?", repeats, until status is no longer
+  Running / Requested / Queued. If that takes more than 2 hours, it raises
+  a timeout error instead of looping forever.
+
+NESSUS POLLING
+  Same idea, but it checks every 30 seconds, up to 1 hour.
+
+
+================================================================
+9. RISK SCORING, WITH A TINY EXAMPLE
+================================================================
+
+Formula (simplified):
+
+  cvss_part     = CVSS * 0.5          (uses v3 if present, else v2)
+  epss_part     = EPSS * 10 * 0.3     (EPSS 0.2 contributes 0.6)
+  exploit_bonus = 1.5 if exploit else 0
+  score         = min(cvss_part + epss_part + exploit_bonus, 10)
+  final         = min(score * asset_criticality, 10)
+
+Example finding:
+  CVSS v3 = 8.0
+  EPSS    = 0.5   (50% chance of exploitation, quite high)
+  exploit exists
+  asset_criticality = 1.0
+
+  cvss_part     = 8.0 * 0.5 = 4.0
+  epss_part     = 0.5 * 10 * 0.3 = 1.5
+  exploit_bonus = 1.5
+  total         = 7.0
+
+That 7.0 is more useful than "High" because it mixes "how bad" with
+"how likely attackers will actually use this".
+
+If the scanner gave no CVSS, the code maps:
+  Low=2.0, Medium=5.0, High=7.5, Critical=9.5
+and then still applies the 50% weight.
+
+
+================================================================
+10. THE API AND THE DASHBOARD
+================================================================
+
+API (src/api/)
+  FastAPI is a Python framework that turns functions into HTTP endpoints.
+
+  POST /scans
+    Body: a list of targets, e.g. ["192.168.1.0/24"]
+    It does NOT wait for the scan to finish (scans can take a long time).
+    It starts the work in the background and immediately replies
+    { "status": "started", "targets": [...] }.
+
+  GET /findings?severity=High&limit=100
+    Reads the database. Optional filter by severity. Sorted worst-first.
+
+  GET /findings/{id}
+    One finding, or HTTP 404 if that id does not exist.
+
+  On startup, main.py runs init_db() so the vulnerabilities table exists.
+
+  Open http://localhost:8000/docs for a clickable manual (Swagger UI).
+
+DASHBOARD (dashboard/app.py)
+  Streamlit is a Python library that turns a script into a simple website.
+  It calls the API (http://api:8000 when running inside Docker).
+
+  You see:
+    - total findings, count of Critical, count of High, average risk
+    - top 10 by risk_score
+    - a bar chart of severity
+    - a line chart of findings per day
+    - a button that POSTs a scan of 192.168.1.0/24
+
+  Results are cached for 300 seconds so the page does not hammer the API
+  on every refresh.
+
+
+================================================================
+11. THE SCHEDULER (THE ALARM CLOCK)
+================================================================
+
+src/scheduler.py uses APScheduler.
+
+When the scheduler container starts, it:
+  1. Runs a scan immediately
+  2. Repeats every SCAN_SCHEDULE_HOURS hours
+
+It reads SCAN_TARGETS from .env, then calls the same Orchestrator.scan_targets
+that the API uses. So "click the button" and "wait for the clock" share one
+brain.
+
+docker-compose waits until Postgres is healthy before starting the
+scheduler, so it does not try to write findings into a database that is
+still booting.
+
+
+================================================================
+12. DOCKER COMPOSE: THE FIVE BOXES
+================================================================
+
+When you run:
+
+  docker-compose up --build
+
+Docker starts five services:
+
+  postgres     Stores findings. Data lives in a volume named postgres_data
+               so it survives container restarts.
+  redis        A fast in-memory store. Wired in config as REDIS_URL.
+  api          The FastAPI app on port 8000 (your PC: http://localhost:8000).
+  scheduler    Background worker that triggers scans on a timer.
+  dashboard    Streamlit on port 8501 (http://localhost:8501).
+
+"Port 8000:8000" means: the program inside the box listens on 8000, and
+your Windows browser can reach it at localhost:8000.
+
+The api service mounts ./src into the container so code changes can reload
+without a full rebuild (--reload).
+
+You still need REAL scanner credentials in .env. Without a live GVM/Nessus
+and a Vulners API key, scans will fail when they try to connect. The rest
+of the stack (API + empty database + dashboard) can still start.
+
+
+================================================================
+13. THE .env FILE (WHAT YOU MUST FILL IN)
+================================================================
+
+  GVM_HOST / GVM_PORT / GVM_USERNAME / GVM_PASSWORD
+      Where your Greenbone/OpenVAS server lives and how to log in.
+
+  NESSUS_URL / NESSUS_ACCESS_KEY / NESSUS_SECRET_KEY
+      Your Nessus (or Tenable) API access.
+
+  VULNERS_API_KEY
+      Key for exploit / EPSS lookups.
+
+  POSTGRES_*
+      Database login. The docker-compose defaults match the example:
+      user vuln, password vulnpass, database vulndb.
+
+  SCAN_TARGETS
+      Comma-separated list of IPs, hostnames, or subnets to scan.
+
+  SCAN_SCHEDULE_HOURS
+      How often the scheduler repeats (default 6).
+
+  API_HOST / API_PORT
+      Where FastAPI listens (0.0.0.0 means "all interfaces", port 8000).
+
+
+================================================================
+14. HOW TO RUN IT (BEGINNER STEPS)
+================================================================
+
+  1. Install Docker Desktop on Windows.
+  2. Open a terminal in the vuln_aggregator folder.
+  3. Copy settings:
+       copy .env.example .env     (or just edit .env; it already exists)
+  4. Put real credentials in .env. Only scan networks you own or have
+     written permission to test.
+  5. Start everything:
+       docker-compose up --build
+  6. Wait until Postgres is healthy and the API starts.
+  7. Browser:
+       http://localhost:8000/docs     API playground
+       http://localhost:8501          Dashboard
+  8. Stop:
+       Ctrl+C in the terminal, or:
+       docker-compose down
+
+
+================================================================
+15. A STORY: ONE FINDING FROM START TO FINISH
+================================================================
+
+You scan 192.168.1.50.
+
+Nessus reports: plugin 12345, CVE-2017-0144, port 445, severity High,
+CVSS 8.1, description about an old Windows file-sharing bug.
+
+GVM might report the same CVE on the same host, or a different issue.
+
+The Nessus connector builds a Vulnerability object with scanner="nessus".
+The ID is a hash of nessus + 12345 + 192.168.1.50 + 445.
+
+Vulners is asked about CVE-2017-0144. It says exploits exist and EPSS is
+high. exploit_available becomes True.
+
+compute_risk produces something like 7+ out of 10.
+
+Dedup checks whether this exact key already appeared in this batch.
+
+PostgreSQL upserts that id. Tomorrow's scan updates scan_timestamp and
+maybe the score, instead of creating "row 2, row 3, row 4".
+
+The dashboard shows it near the top if the score is high. You patch the
+machine (or disable the service), scan again later, and either the finding
+disappears or its details get refreshed.
+
+
+================================================================
+16. WHAT THIS PROJECT IS *NOT*
+================================================================
+
+  - It is not an exploit tool. It collects and ranks defensive scan data.
+  - It is not a replacement for GVM or Nessus. It sits ON TOP of them.
+  - It does not (yet) log in users, send Slack alerts, or store how
+    important each asset is. Those are listed as future extensions.
+  - Redis is included in compose but the core flow does not depend on it
+    for scoring or storage.
+  - tests/ is a placeholder; there is no full automated test suite yet.
+
+
+================================================================
+17. MENTAL MAP (KEEP THIS)
+================================================================
+
+  You / Clock / Dashboard button
+              |
+              v
+         Orchestrator
+          /         \
+       GVM          Nessus          <- scanners look at your network
+          \         /
+           findings (same format)
+                |
+             Vulners                <- extra intel about CVEs
+                |
+           Risk engine              <- 0-10 score
+                |
+           Dedup + Database
+                |
+        API  <---->  Dashboard      <- you look at the ranked list
+
+
+If you remember only one sentence:
+
+  This app runs two vulnerability scanners together, translates their
+  reports into one language, adds exploit intel, scores each finding,
+  stores it, and shows you what to fix first.
+
+Welcome to the intersection of Python, networking, and defensive security.
+You are not expected to understand every library on day one. Follow one
+finding through orchestrator.py and you will understand the whole system.

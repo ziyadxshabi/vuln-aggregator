@@ -1,0 +1,42 @@
+{
+  "scan_id": "42",
+  "hosts": [
+    {
+      "hostname": "web01.example.com",
+      "ip": "10.0.0.10",
+      "os": "Linux Kernel 5.4",
+      "vulnerabilities": [
+        {
+          "plugin_id": 19506,
+          "plugin_name": "SSL Certificate Weak Cipher",
+          "severity": 2,
+          "cve": ["CVE-2016-2107"],
+          "cvss_base_score": 5.8,
+          "cvss3_base_score": 7.4,
+          "cvss3_vector": "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+          "port": 443,
+          "protocol": "tcp",
+          "svc_name": "www",
+          "description": "The remote service supports a weak SSL cipher suite.",
+          "solution": "Reconfigure the service to use strong ciphers.",
+          "see_also": ["https://example.org/ssl"]
+        },
+        {
+          "plugin_id": 10287,
+          "plugin_name": "Traceroute Information",
+          "severity": 0,
+          "cve": [],
+          "cvss_base_score": null,
+          "cvss3_base_score": null,
+          "cvss3_vector": null,
+          "port": 0,
+          "protocol": "udp",
+          "svc_name": null,
+          "description": "Informational traceroute data.",
+          "solution": null,
+          "see_also": []
+        }
+      ]
+    }
+  ]
+}

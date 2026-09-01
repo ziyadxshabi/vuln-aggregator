@@ -1,0 +1,39 @@
+{
+  "ArtifactName": "myapp:1.0.0",
+  "ArtifactType": "container_image",
+  "Results": [
+    {
+      "Target": "myapp:1.0.0 (debian 12.1)",
+      "Class": "os-pkgs",
+      "Type": "debian",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2023-1234",
+          "PkgName": "openssl",
+          "InstalledVersion": "1.1.1n",
+          "FixedVersion": "1.1.1t",
+          "Severity": "CRITICAL",
+          "Title": "OpenSSL buffer overflow",
+          "Description": "A buffer overflow in OpenSSL allows remote code execution.",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2023-1234",
+          "CVSS": {
+            "nvd": {
+              "V3Score": 9.8,
+              "V3Vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+            }
+          },
+          "References": ["https://example.org/openssl"]
+        },
+        {
+          "VulnerabilityID": "GHSA-xxxx-yyyy-zzzz",
+          "PkgName": "leftpad",
+          "InstalledVersion": "1.0.0",
+          "Severity": "LOW",
+          "Title": "Minor issue in leftpad",
+          "Description": "A low severity issue.",
+          "CVSS": {}
+        }
+      ]
+    }
+  ]
+}
