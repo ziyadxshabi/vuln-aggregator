@@ -15,3 +15,4 @@ pyjwt>=2.8
 passlib>=1.7
 python-multipart>=0.0.9
 slowapi>=0.1.9
+aiosqlite>=0.20

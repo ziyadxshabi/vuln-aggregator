@@ -31,7 +31,9 @@ services:
       sh -c "alembic upgrade head &&
              uvicorn src.api.main:app --host 0.0.0.0 --port 8000"
     environment:
-      ENVIRONMENT: production
+      # Change to production only after setting a custom JWT_SECRET in .env
+      # Generate one with: python -c "import secrets; print(secrets.token_hex(32))"
+      ENVIRONMENT: development
       POSTGRES_HOST: postgres
       REDIS_URL: redis://redis:6379/0
     ports:
@@ -76,6 +78,18 @@ services:
         condition: service_healthy
     volumes:
       - ./src:/app/src
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      API_URL: http://api:8000
+    depends_on:
+      - api
+    restart: unless-stopped
 
 volumes:
   postgres_data:

@@ -1,10 +1,12 @@
+import os
+
 import httpx
 import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Vuln Aggregator Dashboard", layout="wide")
 
-API_URL = "http://api:8000"  # When running in Docker
+API_URL = os.getenv("API_URL", "http://api:8000")  # Docker default; override locally
 
 if "token" not in st.session_state:
     st.session_state["token"] = None
