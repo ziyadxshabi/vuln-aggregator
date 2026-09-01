@@ -87,6 +87,8 @@ class TrivyConnector(BaseScannerConnector):
 
     async def start_scan(self, target: str) -> str:
         out_path = Path(tempfile.gettempdir()) / f"trivy-{abs(hash(target))}.json"
+        if out_path.exists():
+            out_path.unlink()
         process = await asyncio.create_subprocess_exec(
             self._settings.trivy_binary,
             "image",
@@ -99,14 +101,30 @@ class TrivyConnector(BaseScannerConnector):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await process.communicate()
+        _stdout, stderr = await process.communicate()
         if process.returncode != 0:
-            raise RuntimeError(f"trivy scan of {target!r} failed (exit {process.returncode})")
+            err_text = stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"trivy scan of {target!r} failed (exit {process.returncode}): {err_text}"
+            )
         return str(out_path)
 
     async def check_scan_status(self, job_id: str) -> ScanStatus:
-        return ScanStatus.COMPLETED if Path(job_id).exists() else ScanStatus.RUNNING
+        path = Path(job_id)
+        if path.exists() and path.stat().st_size > 0:
+            return ScanStatus.COMPLETED
+        return ScanStatus.RUNNING
 
     async def fetch_and_normalize(self, job_id: str) -> list[NormalizedVulnerability]:
         raw = await asyncio.to_thread(Path(job_id).read_text, "utf-8")
-        return normalize_report(json.loads(raw))
+        if not raw.strip():
+            raise RuntimeError(
+                f"Trivy output at {job_id} is empty or malformed — scan may have failed"
+            )
+        try:
+            report = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Trivy output at {job_id} is empty or malformed — scan may have failed"
+            ) from exc
+        return normalize_report(report)

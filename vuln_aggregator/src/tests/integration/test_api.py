@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import httpx
 
 from src.models.enums import Severity
 from src.models.vulnerability import NormalizedVulnerability
-from tests.conftest import FakeDispatcher, auth_token
+
+_conftest_path = Path(__file__).resolve().parent.parent / "conftest.py"
+_spec = importlib.util.spec_from_file_location("integration_conftest", _conftest_path)
+_conftest = importlib.util.module_from_spec(_spec)
+assert _spec.loader is not None
+_spec.loader.exec_module(_conftest)
+FakeDispatcher = _conftest.FakeDispatcher
+auth_token = _conftest.auth_token
 
 SeedFn = Callable[[list[NormalizedVulnerability]], Awaitable[int]]
 

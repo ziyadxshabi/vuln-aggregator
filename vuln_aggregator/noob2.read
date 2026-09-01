@@ -1,0 +1,1045 @@
+# noob2.read — A Complete Beginner's Guide to vuln_aggregator
+
+Hey. If you're reading this, you're probably curious about what this project does and how it works — but you don't want a lecture that assumes you already know half the internet. Good. This guide was written after reading every source file in the project. Grab something warm to drink. We'll go slow.
+
+---
+
+## SECTION 1: WHAT PROBLEM DOES THIS SOLVE?
+
+Picture a school nurse's office on a Monday morning.
+
+Three teachers walk in, one after another, each reporting injuries from recess. The gym teacher hands over a sticky note: "Kid fell, left knee, maybe bad." The art teacher sends an email with a spreadsheet: "Student ID 4472, laceration, severity 3/10, location: playground asphalt." The science teacher calls and reads a paragraph from a printed form with its own rating system.
+
+All three reports might describe the same broken wrist on the same kid — or three different problems on three different kids. The nurse has no shared list, no agreed way to rank urgency, and no time to translate three formats before deciding who needs the ice pack first versus who needs an ambulance.
+
+That is what security teams deal with every week — except the "injuries" are **vulnerabilities** (weaknesses in computers, servers, and apps), and the "teachers" are **scanners** like GVM/OpenVAS, Nessus, and Trivy.
+
+Each scanner dumps findings in its own format. One speaks XML. One speaks JSON with different field names. One reports container image problems in yet another shape. A medium-sized company might get hundreds or thousands of rows after a single scan week — and still have no clear answer to the question that actually matters: **"What should we fix first?"**
+
+This project — **vuln_aggregator** — is the nurse's unified clipboard. It:
+
+1. Runs (or connects to) multiple scanners.
+2. Translates everything into one shared language.
+3. Looks up extra intelligence from government and research feeds.
+4. Calculates a single **risk score** from 0 to 10 for each finding.
+5. Stores results in a database without creating duplicates every time you re-scan.
+6. Exposes it all through a secured web **API** so analysts can query, filter, and track posture over time.
+
+You're not expected to understand every word in that list yet. By the end of this file, you will.
+
+---
+
+## SECTION 2: THE WORDS YOU WILL SEE EVERYWHERE
+
+Each entry: what it **is**, then why **this project** uses it.
+
+---
+
+**CVE** (Common Vulnerabilities and Exposures) — A globally unique name tag for a known security flaw, like `CVE-2021-44228`. This project uses CVE IDs to look up threat intelligence from external feeds and to deduplicate findings across scanners.
+
+**CVSS** (Common Vulnerability Scoring System) — A standard 0–10 number describing how bad a flaw is on paper. This project uses CVSS (preferring version 3.1, then version 2) as the biggest single ingredient in its risk score (40% weight).
+
+**EPSS** (Exploit Prediction Scoring System) — A probability from 0 to 1 estimating how likely a CVE is to be exploited in the wild soon; maintained by FIRST.org. This project fetches EPSS scores and gives them 30% weight in the risk formula because "theoretical bad" and "attackers are actively trying this today" are not the same thing.
+
+**KEV** (Known Exploited Vulnerabilities catalog) — A list published by CISA (a U.S. government cybersecurity agency) of CVEs that attackers are *actually* using right now. This project checks every CVE against KEV and applies a special override that bumps the risk score hard when a match is found.
+
+**Vulnerability** — A weakness that could let an attacker break in, steal data, or cause damage. This project treats each vulnerability as a structured record with fields like title, severity, affected asset, and remediation advice.
+
+**Scanner** — Software that probes computers or containers and reports what is wrong. This project ships connectors for three scanners: GVM (OpenVAS), Nessus, and Trivy.
+
+**Asset** — Anything you're protecting: a server, a website, a container image, a machine with an IP address. This project stores `asset_ip`, `asset_host`, and related fields on every finding.
+
+**Port** — A numbered "door" on a computer where a service listens (for example port 443 for HTTPS). This project includes port number in a finding's identity fingerprint so the same CVE on port 80 and port 443 are tracked separately.
+
+**Protocol** — The rules for how data travels through a port, usually **TCP** or **UDP**. This project stores protocol as part of the fingerprint; Trivy uses `"pkg"` for package-level findings.
+
+**TCP** — A reliable, connection-oriented internet protocol; most web and SSH traffic uses it. This project defaults to `"tcp"` when a scanner doesn't specify otherwise.
+
+**UDP** — A faster, connectionless protocol used for things like DNS and video streaming. Nessus sometimes reports UDP ports; the project stores whatever the scanner sends.
+
+**IP address** — A numeric address for a device on a network, like `10.0.0.5`. This project uses IP addresses to identify which machine a finding belongs to.
+
+**Subnet / CIDR** — A shorthand for a range of IP addresses, like `192.168.1.0/24` (256 addresses). Analysts pass CIDR strings as scan targets in the API's `POST /api/v1/scans` body.
+
+**API** (Application Programming Interface) — A structured way for programs to talk to each other over the network. This project's entire control plane is a FastAPI web API.
+
+**REST** — A style of API design using URLs and HTTP methods (`GET`, `POST`, etc.) to represent actions on resources. This project's routes follow REST conventions under `/api/v1/`.
+
+**JSON** — A text format for structured data using `{` braces `}` and `[` brackets `]`. Scanners, the API, and Redis cache entries all speak JSON.
+
+**JWT** (JSON Web Token) — A signed, tamper-evident string that proves who you are without sending your password on every request. This project returns a JWT from `/api/v1/auth/token` and expects it in the `Authorization: Bearer ...` header.
+
+**RBAC** (Role-Based Access Control) — Security model where permissions depend on your role, not your name. This project defines three roles: ADMIN, ANALYST, and READ_ONLY.
+
+**Token** — Here, the JWT string you get after logging in. You attach it to API requests like a wristband (more on that in Section 8).
+
+**Endpoint** — A specific URL + HTTP method combo the API exposes, like `GET /api/v1/vulnerabilities`. Each endpoint lives in a file under `src/api/routes/`.
+
+**Upsert** — "Update if exists, insert if not." This project upserts findings so re-scanning the same flaw updates one row instead of creating duplicates.
+
+**Fingerprint** — A deterministic ID computed from stable fields (scanner + vuln ID + IP + port + protocol). Implemented as SHA-256 in `fingerprint()` inside `src/models/vulnerability.py`.
+
+**Enrichment** — Adding extra intelligence to a raw scanner finding — EPSS scores, KEV status, exploit availability, CVSS from NVD. Done by `EnrichmentPipeline` in `src/enrichment/pipeline.py`.
+
+**Risk score** — A single 0.0–10.0 number combining CVSS, EPSS, exploit flags, KEV override, and asset criticality. Calculated by `compute_risk()` in `src/engine/risk_engine.py`.
+
+**Severity** — A human-readable bucket: INFO, LOW, MEDIUM, HIGH, CRITICAL. The project normalizes all scanner severities into these five values in `src/models/enums.py`.
+
+**Celery** — A Python task queue library for running slow jobs in the background. This project uses Celery instead of the old APScheduler approach to run scans without blocking the API.
+
+**Worker** — A Celery process that picks up tasks from the queue and executes them. Started in Docker by the `worker` service running `celery ... worker`.
+
+**Beat** — Celery's scheduler that fires recurring tasks on a timer. The `beat` service refreshes the KEV catalog and runs scheduled estate scans.
+
+**Broker** — The message middleman between the API and workers; here, Redis. Configured in `src/workers/celery_app.py` via `settings.broker_url`.
+
+**ORM** (Object-Relational Mapper) — Python code that represents database tables as classes so you don't write raw SQL for everything. SQLAlchemy ORM models live in `src/database/orm.py`.
+
+**Migration** — A version-controlled script that creates or changes database tables. Alembic migration `alembic/versions/0001_initial.py` creates the `vulnerabilities` and `scan_jobs` tables.
+
+**asyncio / async / await** — Python's way of doing many waiting tasks (network calls, DB queries) without freezing the whole program. Nearly every I/O path in this project is async.
+
+**Pydantic** — A library that validates and structures Python data with type hints. Domain models (`NormalizedVulnerability`) and API schemas (`VulnerabilityResponse`) are Pydantic models.
+
+**SQLAlchemy** — The database toolkit powering the async engine, sessions, and ORM. See `src/database/base.py` and `src/database/repository.py`.
+
+**Redis** — An in-memory data store used as Celery's broker and as a TTL cache for enrichment results. Configured via `REDIS_URL` in `.env`.
+
+**PostgreSQL** — A powerful open-source relational database. Production Docker setup uses Postgres 16; tests use SQLite for speed.
+
+**Docker** — A tool that packages apps and their dependencies into isolated **containers**. The project's `docker-compose.yml` runs Postgres, Redis, API, worker, and beat together.
+
+**Container** — A lightweight, isolated runtime environment — like a shipping container for software. Each service in `docker-compose.yml` runs in its own container.
+
+**Environment variable** — A configuration value set outside the code, like `JWT_SECRET=...` in the `.env` file. The project loads these through `Settings` in `src/config.py`.
+
+---
+
+## SECTION 3: THE FOLDER STRUCTURE EXPLAINED LINE BY LINE
+
+We'll walk the project root and the folders that actually matter. Config files and tests included.
+
+---
+
+### Root level
+
+**`README.md`** — The technical overview for developers: architecture diagram, API table, Docker commands, risk formula. Read this after this guide when you want the condensed version.
+
+**`noob.read`** — An older beginner guide written for the *previous* prototype architecture. Still useful for concepts, but it references files that no longer exist (see Section 10).
+
+**`noob2.read`** — This file. Hello.
+
+**`pyproject.toml`** — Python project metadata: dependencies, pytest/mypy/ruff settings. Tells tools how to lint and test the code.
+
+**`requirements.txt`** — Flat list of runtime pip packages for Docker builds. Mirrors the main dependencies in `pyproject.toml`.
+
+**`.env`** — Your local secrets and settings (database password, JWT secret, scanner keys). Never commit real secrets to git.
+
+**`.env.example`** — A template showing every variable the app understands, with safe placeholder values.
+
+**`.gitignore`** — Tells git to ignore `.venv/`, `.env`, caches, and other generated junk.
+
+**`Dockerfile`** — Instructions to build the Python 3.12 app image used by api, worker, and beat services.
+
+**`docker-compose.yml`** — Orchestrates five services: postgres, redis, api, worker, beat. Note: the old Streamlit dashboard is *not* included here anymore.
+
+**`alembic.ini`** — Alembic configuration pointing at the `alembic/` migration folder.
+
+---
+
+### `alembic/` — Database migrations
+
+**`alembic/env.py`** — Connects Alembic to the app's async database URL from settings and runs migrations.
+
+**`alembic/script.py.mako`** — Template for generating new migration files.
+
+**`alembic/versions/0001_initial.py`** — Creates the `vulnerabilities` and `scan_jobs` tables with indexes. Example: first `docker compose up` runs `alembic upgrade head` and builds these tables before the API starts.
+
+---
+
+### `src/` — All application source code
+
+**`src/__init__.py`** — Marks `src` as a Python package; holds `__version__ = "1.0.0"`.
+
+**`src/config.py`** — Loads every setting from environment variables into a typed `Settings` object. Example: reads `SCAN_TARGETS=192.168.1.0/24,example.com` and splits it into a Python list.
+
+---
+
+### `src/models/` — The domain core (pure business concepts)
+
+**`src/models/enums.py`** — Named constants: `ScanStatus`, `Severity`, `Role`, `AssetCriticality`, `FindingStatus`. Example: `Severity.CRITICAL` is used when risk score ≥ 9.0.
+
+**`src/models/vulnerability.py`** — The heart of the domain: `NormalizedVulnerability`, `fingerprint()`, `RiskSignal`, `RiskResult`. Example: two scans of the same Nessus plugin on the same IP/port produce the same `id`.
+
+**`src/models/enrichment.py`** — `EnrichmentData` dataclass holding merged intel from KEV, EPSS, and NVD for one CVE.
+
+**`src/models/posture.py`** — `PostureMetrics` dataclass for aggregated stats (total findings, KEV count, exposure score, MTTR).
+
+**`src/models/scan.py`** — `ScanJob` model tracking a multi-scanner scan request's status and targets.
+
+**`src/models/ports.py`** — Protocol interfaces (ThreatIntelPort, CachePort, VulnerabilityRepositoryPort, etc.). These are the "contracts" adapters must satisfy. Example: `ScanService` depends on `ThreatIntelPort`, not on Redis directly.
+
+**`src/models/__init__.py`** — Re-exports the main domain types for convenient importing.
+
+---
+
+### `src/engine/` — Pure risk math
+
+**`src/engine/risk_engine.py`** — `compute_risk()` and `severity_from_score()`. No network, no database — just math. Example: given CVSS 9.8 and EPSS 0.5, returns score 5.42.
+
+**`src/engine/__init__.py`** — Re-exports the risk functions.
+
+---
+
+### `src/connectors/` — Scanner adapters
+
+**`src/connectors/base.py`** — Abstract `BaseScannerConnector` with three methods every scanner must implement: `start_scan`, `check_scan_status`, `fetch_and_normalize`.
+
+**`src/connectors/gvm.py`** — Greenbone/OpenVAS connector. Parses GMP XML reports via pure `normalize_report()`. Talks to GVM using `python-gvm` in background threads.
+
+**`src/connectors/nessus.py`** — Tenable Nessus connector. Uses `httpx` to call the Nessus REST API and paginate per-host plugin details.
+
+**`src/connectors/trivy.py`** — Runs the `trivy` CLI as a subprocess, reads JSON output, normalizes container/package vulnerabilities.
+
+**`src/connectors/__init__.py`** — `CONNECTOR_REGISTRY` dict mapping `"gvm"`, `"nessus"`, `"trivy"` to their connector classes.
+
+---
+
+### `src/enrichment/` — Threat intelligence pipeline
+
+**`src/enrichment/cache.py`** — `InMemoryTTLCache` (for tests/single process) and `RedisTTLCache` (shared across worker and API).
+
+**`src/enrichment/cisa_kev.py`** — Downloads and caches the CISA KEV JSON catalog; answers `is_known_exploited(cve)`.
+
+**`src/enrichment/epss.py`** — Batches CVE lookups against the FIRST EPSS API.
+
+**`src/enrichment/exploit_intel.py`** — Queries NVD for CVSS v3.1 vectors and exploit tags; optionally escalates to Vulners for weaponization signals.
+
+**`src/enrichment/pipeline.py`** — `EnrichmentPipeline.enrich()` orchestrates all feeds with per-CVE caching and concurrency limits.
+
+**`src/enrichment/__init__.py`** — Re-exports enrichment classes.
+
+---
+
+### `src/database/` — Persistence layer
+
+**`src/database/base.py`** — `Database` class wrapping the async SQLAlchemy engine and session factory; `Base` declarative base for ORM.
+
+**`src/database/orm.py`** — `VulnerabilityRow` and `ScanJobRow` table definitions with compound indexes on `(asset_ip, port, scanner_vuln_id)` and `(cve_id)`.
+
+**`src/database/repository.py`** — `VulnerabilityRepository` (bulk upsert, cursor pagination, posture queries) and `ScanJobRepository` (create/get/update scan jobs).
+
+**`src/database/__init__.py`** — Re-exports database public API.
+
+---
+
+### `src/services/` — Application use cases
+
+**`src/services/scan_service.py`** — `ScanService.execute()` runs the full pipeline: collect → enrich → score → upsert. This is the brain of a scan.
+
+**`src/services/posture_service.py`** — Thin wrapper calling `vuln_repo.posture()` for the metrics endpoint.
+
+**`src/services/factory.py`** — Wires concrete adapters into a ready-to-use `ScanService` (connectors, cache, enrichment, repos).
+
+**`src/services/__init__.py`** — Re-exports services.
+
+---
+
+### `src/workers/` — Background tasks
+
+**`src/workers/celery_app.py`** — Creates the Celery app, configures Redis broker, defines beat schedule (KEV refresh + scheduled scans).
+
+**`src/workers/tasks.py`** — Celery task functions: `run_scan_task`, `refresh_kev_task`, `scheduled_scan_task`. Each uses `asyncio.run()` to execute async code.
+
+**`src/workers/dispatcher.py`** — `CeleryTaskDispatcher.dispatch_scan()` enqueues `run_scan_task.delay(...)`.
+
+**`src/workers/__init__.py`** — Re-exports celery app and dispatcher.
+
+---
+
+### `src/api/` — HTTP control plane
+
+**`src/api/main.py`** — FastAPI app factory: lifespan (DB setup), request-ID middleware, `/health` endpoint, mounts v1 routes.
+
+**`src/api/errors.py`** — Standard error envelope and exception handlers (`AuthError`, `NotFoundError`, etc.).
+
+**`src/api/security.py`** — JWT creation/validation, `UserStore`, RBAC via `require_roles()`.
+
+**`src/api/schemas.py`** — Pydantic request/response models for the API (`ScanRequest`, `VulnerabilityResponse`, etc.).
+
+**`src/api/deps.py`** — FastAPI dependency injection: database sessions, repositories, dispatcher, settings.
+
+**`src/api/routes/auth.py`** — `POST /api/v1/auth/token` — login endpoint.
+
+**`src/api/routes/scans.py`** — `POST /api/v1/scans` and `GET /api/v1/scans/{task_id}`.
+
+**`src/api/routes/vulnerabilities.py`** — `GET /api/v1/vulnerabilities` (list with filters) and `GET /api/v1/vulnerabilities/{id}`.
+
+**`src/api/routes/metrics.py`** — `GET /api/v1/metrics/posture`.
+
+**`src/api/routes/__init__.py`** — Bundles all routers under `/api/v1`.
+
+**`src/api/__init__.py`** — Exports `app` and `create_app`.
+
+---
+
+### `src/observability/` — Logging and tracing
+
+**`src/observability/logging.py`** — Configures `structlog` for JSON or console output.
+
+**`src/observability/tracing.py`** — Optional OpenTelemetry instrumentation (only activates if otel packages are installed).
+
+**`src/observability/__init__.py`** — Re-exports logging/tracing helpers.
+
+---
+
+### `src/tests/` — Automated tests
+
+**`src/tests/conftest.py`** — Pytest fixtures: in-memory SQLite database, test FastAPI app, fake Celery dispatcher, auth helper.
+
+**`src/tests/fixtures/`** — Sample GVM XML, Nessus JSON, and Trivy JSON reports for normalization tests.
+
+**`src/tests/unit/test_risk_engine.py`** — Pure math tests for `compute_risk()`.
+
+**`src/tests/unit/test_normalization.py`** — Tests that fixture reports parse into correct `NormalizedVulnerability` objects.
+
+**`src/tests/unit/test_repository_upsert.py`** — Tests upsert deduplication and cursor pagination.
+
+**`src/tests/integration/test_api.py`** — End-to-end API tests with auth, RBAC, listing, and scan launch.
+
+---
+
+### `dashboard/` — Legacy UI (broken against new API)
+
+**`dashboard/app.py`** — Streamlit web dashboard. Still present but outdated — calls old endpoints without auth (see Section 10).
+
+**`dashboard/requirements.txt`** — Streamlit, httpx, pandas dependencies for the dashboard only.
+
+---
+
+## SECTION 4: HOW THE CODE IS ORGANIZED (THE ARCHITECTURE)
+
+This is one of the harder parts — but the analogy makes it click.
+
+### The restaurant kitchen
+
+Imagine a restaurant:
+
+- **The recipe book** = the **domain** (`src/models/` + `src/engine/`). Pure rules: what a "finding" is, how risk is calculated, what statuses mean. No mention of Postgres, Redis, Nessus, or HTTP. Just truth.
+
+- **The waiter tickets** = the **ports** (`src/models/ports.py`). Abstract requests like "store these findings" or "enrich these CVEs" or "dispatch this scan job." The kitchen (business logic) writes tickets. It doesn't care who fulfills them.
+
+- **The suppliers and delivery drivers** = the **adapters**:
+  - `src/connectors/` — scanner drivers (GVM, Nessus, Trivy)
+  - `src/enrichment/` — threat intel feeds (KEV, EPSS, NVD)
+  - `src/database/` — Postgres persistence
+  - `src/workers/` — Celery background jobs
+  - `src/api/` — FastAPI HTTP interface
+
+- **The head chef coordinating dinner service** = **services** (`src/services/scan_service.py`). Reads tickets, follows recipes, sends tickets to adapters.
+
+This pattern is called **Hexagonal Architecture** (also **Ports and Adapters** or **Clean Architecture**). The domain sits in the center. Everything else plugs in around it.
+
+### How the folders map
+
+```
+         [ src/api/ ]  ← customers order via HTTP
+              ↓
+    [ src/services/ ]  ← head chef (use cases)
+              ↓
+  [ src/models/ + src/engine/ ]  ← recipes & rules (domain)
+              ↓ ports (interfaces)
+    ┌─────────┼─────────┬──────────┐
+    ↓         ↓         ↓          ↓
+connectors  enrichment  database  workers
+```
+
+### Why this matters in plain terms
+
+Say your company switches from Nessus to a new scanner called "AcmeScan." In a tangled codebase, you'd hunt through dozens of files. Here, you:
+
+1. Create `src/connectors/acme.py` implementing `BaseScannerConnector`.
+2. Register it in `CONNECTOR_REGISTRY` in `src/connectors/__init__.py`.
+3. Done. Scan service, risk engine, enrichment, database — **zero changes**.
+
+That's the whole point. The recipe doesn't change because you switched tomato suppliers.
+
+---
+
+## SECTION 5: WHAT HAPPENS WHEN YOU START A SCAN — STEP BY STEP
+
+We'll trace an analyst launching a scan of `10.0.0.0/24` with GVM and Nessus, from button-click to database row.
+
+**Step 1 — The analyst sends an HTTP request.**
+
+They `POST` to `/api/v1/scans` with JSON body `{"targets": ["10.0.0.0/24"], "scanners": ["gvm", "nessus"]}` and an `Authorization: Bearer <token>` header. FastAPI receives this in `src/api/routes/scans.py`, function `launch_scan()`.
+
+**Step 2 — Auth is checked.**
+
+`require_roles(Role.ANALYST)` in `src/api/security.py` verifies the JWT and confirms the user is ANALYST or ADMIN. READ_ONLY users get a 403 Forbidden.
+
+**Step 3 — A scan job row is created.**
+
+`ScanJobRepository.create()` in `src/database/repository.py` inserts a new row into `scan_jobs` with status `PENDING` and a random UUID. This gives the analyst a `job.id` to poll later.
+
+**Step 4 — Work is queued to Celery.**
+
+`CeleryTaskDispatcher.dispatch_scan()` in `src/workers/dispatcher.py` calls `run_scan_task.delay(job_id, targets, scanners)`. The task lands in Redis. The API immediately returns HTTP 202 with the job details — it does *not* wait for scans to finish.
+
+**Step 5 — A Celery worker picks up the task.**
+
+The `worker` container runs `run_scan_task()` from `src/workers/tasks.py`. That function calls `asyncio.run(_run_scan(...))`, opens a database session, and builds a `ScanService` via `build_scan_service()` in `src/services/factory.py`.
+
+**Step 6 — ScanService marks the job RUNNING.**
+
+`ScanService.execute()` in `src/services/scan_service.py` calls `job_repo.set_status(job_id, ScanStatus.RUNNING)`.
+
+**Step 7 — Scanners are invoked in parallel.**
+
+`_collect()` builds a list of async tasks — one per (scanner, target) pair. For each, `_scan_one()` calls `connector.start_scan(target)` on the appropriate adapter (`GVMConnector` or `NessusConnector`).
+
+**Step 8 — The worker polls until each scanner finishes.**
+
+`_poll()` loops: `connector.check_scan_status(job_id)` every 10 seconds (configurable), up to 7200 seconds (2 hours). GVM and Nessus report RUNNING until done; Trivy finishes synchronously.
+
+**Step 9 — Raw reports are normalized.**
+
+When status is COMPLETED, `connector.fetch_and_normalize(job_id)` returns a list of `NormalizedVulnerability` objects. GVM parses XML via `normalize_report()`; Nessus parses JSON the same way. Each finding gets a deterministic `id` from `fingerprint()`.
+
+**Step 10 — Findings are enriched with threat intel.**
+
+`_enrich()` collects all CVE IDs and calls `EnrichmentPipeline.enrich()` in `src/enrichment/pipeline.py`. For each CVE, it checks cache, then KEV, EPSS, and NVD/Vulners. Results are merged into each finding's EPSS score, KEV flag, exploit flag, and enrichment_sources list.
+
+**Step 11 — Risk scores are calculated.**
+
+`_score()` calls `compute_risk()` from `src/engine/risk_engine.py` for each finding. The score and tier are written back onto the `NormalizedVulnerability` objects in memory.
+
+**Step 12 — Findings are upserted into Postgres.**
+
+`VulnerabilityRepository.bulk_upsert()` in `src/database/repository.py` batch-inserts all findings. If a finding's fingerprint `id` already exists, it updates scores, timestamps, and enrichment fields instead of creating a duplicate row.
+
+**Step 13 — The job is marked COMPLETED.**
+
+`job_repo.set_status(job_id, ScanStatus.COMPLETED, total_findings=stored)` updates the scan_jobs row. The analyst can now `GET /api/v1/scans/{job_id}` and see the result, then browse findings at `GET /api/v1/vulnerabilities`.
+
+---
+
+## SECTION 6: THE RISK SCORE — THE MATH IN PLAIN ENGLISH
+
+Open `src/engine/risk_engine.py`. Here's what it does, told as a cooking story.
+
+### The ingredients
+
+Think of each vulnerability like a dish you're judging at a cook-off.
+
+**CVSS is the base recipe (40% of the final taste).** How inherently dangerous is this flaw on a 0–10 scale? If the scanner gave a CVSS v3 score, use it. If not, try CVSS v2. If neither exists, fall back to a severity label (HIGH ≈ 8.0, MEDIUM ≈ 5.5, etc.). This is the "how bad is the recipe on paper" score.
+
+**EPSS is how hungry the crowd is for it right now (30%).** EPSS runs from 0 to 1. The engine stretches it to 0–10 (multiply by 10) and takes 30% of that. A CVE with EPSS 0.5 contributes 1.5 points (because 0.5 × 10 × 0.30 = 1.5). Zero EPSS contributes nothing.
+
+**The exploit flag is whether Gordon Ramsay already demonstrated it on TV (15%).** If `has_weaponized_exploit` is true — meaning public exploit code exists — the engine adds a flat 15% of the maximum (0.15 × 10 = 1.5 points). No exploit, zero bonus.
+
+These three are added together into a **base score**.
+
+**KEV override is the health inspector shutting down the kitchen.** If the CVE is on CISA's Known Exploited Vulnerabilities list (`is_known_exploited = true`), the engine adds a 1.5-point boost *and* enforces a floor of 9.0 before the final multiplier. This reflects real-world urgency: attackers are actively using this flaw *today*.
+
+**Asset criticality is the size of the audience (multiplier 0.5× to 1.5×).** A flaw on a production payment server might use multiplier 1.5; a test lab machine might use 0.5. Default is 1.0. Applied last, then the result is capped at 10.0.
+
+The final number is rounded to two decimal places. The **tier** (INFO / LOW / MEDIUM / HIGH / CRITICAL) is derived from the final score using the same breakpoints as CVSS.
+
+### Worked example 1 — No KEV, no exploit
+
+A Nessus finding with CVSS v3 = 9.8 and EPSS = 0.5.
+
+- CVSS portion: 40% of 9.8 = **3.92**
+- EPSS portion: 30% of (0.5 × 10) = 30% of 5.0 = **1.50**
+- Exploit portion: no public exploit = **0.00**
+- Base total: 3.92 + 1.50 + 0.00 = **5.42**
+- KEV override: not on KEV list, no change.
+- Asset multiplier: 1.0 (default) → **5.42**
+
+Tier: MEDIUM (score is between 4.0 and 7.0).
+
+(This exact case is tested in `src/tests/unit/test_risk_engine.py`.)
+
+### Worked example 2 — KEV override in action
+
+Same finding, but it's CVE-2021-44228 (Log4Shell) on CISA KEV with EPSS 0.95 and a public exploit.
+
+- CVSS portion: 40% of 10.0 = **4.00**
+- EPSS portion: 30% of 9.5 = **2.85**
+- Exploit portion: **1.50**
+- Base total: 4.00 + 2.85 + 1.50 = **8.35**
+- KEV override kicks in: add 1.5 → 9.85, and enforce floor of 9.0 → **9.85**
+- Asset multiplier 1.0 → final score **9.85**, tier **CRITICAL**
+
+Without KEV override, that finding would score ~8.35 (HIGH). KEV bumps it to near-maximum because government confirmed active exploitation. That's why KEV matters more than a single CVSS point.
+
+---
+
+## SECTION 7: THE DATABASE — HOW FINDINGS ARE STORED WITHOUT DUPLICATES
+
+### The filing cabinet (ORM)
+
+Without an **ORM**, saving a finding would mean writing SQL by hand:
+
+```sql
+INSERT INTO vulnerabilities (id, scanner, title, ...) VALUES (...);
+```
+
+Every query, every column name, every typo — your problem.
+
+An **ORM** (Object-Relational Mapper) lets Python classes mirror database tables. `VulnerabilityRow` in `src/database/orm.py` *is* the `vulnerabilities` table. You work with Python objects; SQLAlchemy generates the SQL.
+
+Think of it as labeled folders in a filing cabinet. Each drawer (`VulnerabilityRow`) has labeled slots (`id`, `scanner`, `risk_score`, ...). The repository (`VulnerabilityRepository`) is the clerk who files and retrieves papers.
+
+### The SHA-256 fingerprint
+
+When a finding enters the system, its **id** is not random. The function `fingerprint()` in `src/models/vulnerability.py` builds a string:
+
+```
+gvm|1.3.6.1.4.1.25623.1.0.100001|10.0.0.5|22|tcp
+```
+
+Then runs SHA-256 and takes the hex digest. Same scanner + same plugin + same IP + same port + same protocol = **same id every time**.
+
+This is intentional. Re-scanning the network next week should *update* the existing record (refresh risk score, bump `last_seen`), not spawn a duplicate.
+
+### Upsert — one row, not two
+
+`bulk_upsert()` uses PostgreSQL's `INSERT ... ON CONFLICT (id) DO UPDATE`. Plain English:
+
+- "Try to insert this finding."
+- "If the `id` already exists, update the mutable columns instead."
+
+Columns that get refreshed on conflict include `risk_score`, `epss_score`, `last_seen`, `enrichment_sources`, and others listed in `_UPSERT_UPDATE_COLUMNS` in `repository.py`. The original `first_seen` timestamp is preserved from the first time the flaw was observed.
+
+Within a single scan batch, duplicates are also collapsed — if two identical fingerprints appear, the one with the higher risk score wins.
+
+### The `vulnerabilities` table columns
+
+| Column | What it means in plain English |
+|--------|-------------------------------|
+| `id` | Unique fingerprint hash — the filing folder label |
+| `scanner` | Which tool found it: `gvm`, `nessus`, or `trivy` |
+| `scanner_vuln_id` | The scanner's internal plugin/check ID |
+| `cve_id` | Public CVE name, if known (e.g. `CVE-2023-1234`) |
+| `asset_host` | Hostname or friendly name of the affected system |
+| `asset_ip` | IP address or image name of the affected system |
+| `asset_os` | Operating system or package ecosystem, if known |
+| `port` | Network port number (0 for non-network findings like packages) |
+| `protocol` | `tcp`, `udp`, or `pkg` |
+| `service` | Service name on that port, or package name for Trivy |
+| `title` | Short name of the vulnerability |
+| `description` | Longer explanation of the problem |
+| `solution` | How to fix it (patch, upgrade, config change) |
+| `severity` | Qualitative band: INFO, LOW, MEDIUM, HIGH, CRITICAL |
+| `cvss_v2_score` | CVSS version 2 numeric score, if available |
+| `cvss_v3_score` | CVSS version 3 numeric score, if available |
+| `cvss_v3_vector` | Full CVSS v3 vector string for auditors |
+| `epss_score` | Exploit prediction probability (0–1) from FIRST.org |
+| `epss_percentile` | How this CVE ranks vs all others in EPSS |
+| `is_known_exploited` | True if on CISA KEV list |
+| `has_weaponized_exploit` | True if public exploit code is known |
+| `enrichment_sources` | JSON list of feeds that contributed data |
+| `risk_score` | Final computed 0–10 priority score |
+| `risk_tier` | Severity tier derived from risk_score |
+| `status` | OPEN or RESOLVED |
+| `scan_job_id` | Which scan job last touched this finding |
+| `first_seen` | When we first observed this flaw |
+| `last_seen` | When we last confirmed it still exists |
+| `resolved_at` | When it was marked fixed, if ever |
+
+There's also a `scan_jobs` table tracking scan requests (status, targets, scanners, error messages, timestamps).
+
+### Cursor pagination — bookmarks in a sorted pile
+
+Listing vulnerabilities returns them sorted by `risk_score` descending (worst first). There might be thousands of rows — you don't want them all at once.
+
+**Cursor pagination** means: "Here are the top 50. Here's a bookmark (`next_cursor`) if you want the next 50."
+
+The cursor encodes the last row's risk score and id (base64-encoded). The next request passes that cursor, and the query says "give me rows *after* this bookmark." Like keeping your thumb in a sorted stack of exam papers.
+
+Implemented in `_encode_cursor()` / `_decode_cursor()` in `src/database/repository.py`.
+
+---
+
+## SECTION 8: AUTHENTICATION AND WHO CAN DO WHAT
+
+### JWT wristbands
+
+When you go to a concert, you show your ticket once at the door and get a **wristband**. You don't show your ticket at the bar, the bathroom, and the merch stand — you flash the wristband.
+
+**JWT** works the same way for the API:
+
+1. You `POST /api/v1/auth/token` with username and password (once).
+2. The server verifies credentials and returns a signed **token** string.
+3. On every subsequent request, you send `Authorization: Bearer <token>`.
+4. The server verifies the signature and reads your username and role from inside the token — no password needed again.
+
+Tokens expire after `ACCESS_TOKEN_EXPIRE_MINUTES` (default 60). When expired, you log in again.
+
+The signing key is `JWT_SECRET` from your `.env`. If someone steals this secret, they can forge wristbands. Guard it.
+
+Implementation lives in `src/api/security.py`: `create_access_token()`, `decode_token()`, `get_current_user()`.
+
+### The three roles
+
+| Role | Can do |
+|------|--------|
+| **ADMIN** | Everything. Bypasses all role checks. |
+| **ANALYST** | Launch scans (`POST /api/v1/scans`), plus all read endpoints. |
+| **READ_ONLY** | View vulnerabilities, scan status, and posture metrics. Cannot launch scans. |
+
+If a READ_ONLY user tries to launch a scan, `require_roles(Role.ANALYST)` raises `ForbiddenError` → HTTP 403 with a clear error envelope.
+
+Default seed users (from `.env`):
+
+- `admin` / `admin123` → ADMIN
+- `analyst` / `analyst123` → ANALYST
+- `viewer` / `viewer123` → READ_ONLY
+
+### Where users come from
+
+There is no users table in the database. Users are defined in the **`AUTH_USERS`** environment variable as comma-separated entries:
+
+```
+admin:admin123:ADMIN,analyst:analyst123:ANALYST,viewer:viewer123:READ_ONLY
+```
+
+Format: `username:password:ROLE`
+
+At startup, `UserStore` in `src/api/security.py` parses this string and builds an in-memory dictionary.
+
+### What passlib is doing
+
+Storing plain-text passwords would be catastrophic — anyone with database or log access sees them. **passlib** hashes each password using **pbkdf2_sha256** when `UserStore` initializes. When you log in, `passlib.verify()` checks your typed password against the stored hash without ever reversing it. The raw password `"analyst123"` is never stored; only a long hash string is kept in memory.
+
+---
+
+## SECTION 9: THE ENRICHMENT PIPELINE — WHERE THE EXTRA INTEL COMES FROM
+
+Scanners tell you *what* they found. Enrichment tells you *how much you should panic*.
+
+### CISA KEV — the government's "fix this NOW" list
+
+**CISA** (Cybersecurity and Infrastructure Security Agency) publishes the **Known Exploited Vulnerabilities** catalog — a JSON feed of CVEs that real attackers are actively exploiting in the wild. Not theoretical. Not "maybe someday." Happening now.
+
+Being on KEV means: patch immediately, even if CVSS looks merely "High." This project downloads the catalog (`CISAKEVCatalog` in `src/enrichment/cisa_kev.py`), caches it in Redis for 24 hours, and checks every finding's CVE against it. A match sets `is_known_exploited = true` and triggers the KEV override in the risk engine.
+
+### EPSS — exploitation weather forecast
+
+**EPSS** is maintained by **FIRST.org** (Forum of Incident Response and Security Teams). It assigns each CVE a probability (0–1) of being exploited in the next 30 days, based on machine learning over real-world data. CVSS says how bad a flaw *could* be; EPSS estimates how likely exploitation *is*.
+
+The `EPSSClient` in `src/enrichment/epss.py` batches CVE lookups against `https://api.first.org/data/v1/epss`.
+
+### NVD and Vulners — CVSS details and exploit signals
+
+**NVD** (National Vulnerability Database), run by NIST, is the authoritative U.S. government source for CVE details, CVSS v3.1 vectors, and reference links tagged as exploits. `ExploitIntelClient._query_nvd()` in `src/enrichment/exploit_intel.py` pulls this data.
+
+**Vulners** is a commercial/combined vulnerability search engine. If NVD doesn't flag exploit availability and a `VULNERS_API_KEY` is configured, the client asks Vulners for proof-of-concept or wild-exploitation signals.
+
+### The TTL cache — don't call Washington 500 times
+
+Imagine scanning 200 servers that all have the same OpenSSL CVE. Without caching, the enrichment pipeline would call EPSS, NVD, and KEV lookups 200 times for one CVE.
+
+The **TTL cache** (Time To Live) stores enrichment results in Redis (or in-memory during tests) keyed by `enrichment:CVE-2023-1234`. Default TTL: 6 hours (`ENRICHMENT_CACHE_TTL_SECONDS=21600`). First lookup hits the APIs; subsequent lookups within 6 hours read from cache.
+
+The pipeline in `EnrichmentPipeline.enrich()` checks cache first, only fetches uncached CVEs, and limits concurrent API calls to 8 at a time via an asyncio semaphore.
+
+---
+
+## SECTION 10: THE THINGS THAT ARE BROKEN OR MISSING
+
+Honesty builds trust. Here are known gaps as of this writing.
+
+### 1. Dashboard calls `/findings` but the API route is `/api/v1/vulnerabilities`
+
+**File:** `dashboard/app.py` line 18 — `httpx.get(f"{API_URL}/findings", ...)`
+
+The refactored API exposes findings at `GET /api/v1/vulnerabilities`. The old `/findings` route no longer exists. The dashboard always gets a non-200 response and shows "No findings yet."
+
+**Fix:** Change the URL to `{API_URL}/api/v1/vulnerabilities`, add the auth header, and adjust response parsing (the API returns `{"items": [...], "count": ..., "next_cursor": ...}` not a bare list).
+
+### 2. Dashboard has no auth header — every call would return 401 anyway
+
+Even with the correct URL, the dashboard never sends `Authorization: Bearer ...`. All vulnerability endpoints require authentication via `get_current_user()`.
+
+**Fix:** Add a login step or a configured token in the dashboard, and pass it on every httpx request.
+
+### 3. `noob.read` references APScheduler and `orchestrator.py` which no longer exist
+
+The first beginner guide describes `src/scheduler.py` and `src/orchestrator.py`. Both were deleted in the enterprise refactor. Scheduling now lives in Celery beat (`src/workers/celery_app.py`) and orchestration in `src/services/scan_service.py`.
+
+**Fix:** Read `noob2.read` (this file) instead, or update `noob.read` to match the new architecture.
+
+### 4. Trivy connector has a race condition in `check_scan_status`
+
+**File:** `src/connectors/trivy.py` lines 107–108.
+
+`check_scan_status()` returns COMPLETED if the output file path exists, RUNNING otherwise. But `start_scan()` uses a fixed path based on `hash(target)` — `trivy-{abs(hash(target))}.json`. If a previous scan's file still exists on disk, a *new* scan could be incorrectly reported as COMPLETED before Trivy finishes writing fresh results. Conversely, if Trivy is mid-write, partial state could confuse polling.
+
+**Fix:** Use a unique temp file per scan (UUID in the filename), track in-memory scan state, or delete the old file before starting a new scan. Have `check_scan_status` verify the subprocess exit, not just file existence.
+
+### 5. Enrichment pipeline has no dedicated unit tests
+
+Risk engine, normalization, repository, and API routes all have tests under `src/tests/`. There is no `test_enrichment.py` mocking KEV/EPSS/NVD HTTP responses. Enrichment bugs would only surface during live scans or manual testing.
+
+**Fix:** Add tests with `httpx` mock transports or `pytest-httpx` covering cache hits, KEV matches, EPSS batching, and NVD parsing.
+
+### 6. JWT secret is a hardcoded dev string that must be changed in production
+
+**File:** `.env` — `JWT_SECRET=dev-only-secret-change-me-0123456789abcdef`
+
+This is fine for local Docker. In any shared or internet-facing deployment, anyone who knows this string can forge admin tokens.
+
+**Fix:** Generate a random 64+ character secret per environment. Use a secrets manager (AWS Secrets Manager, Vault, etc.) rather than a committed `.env` file.
+
+### 7. No rate limiting on the API
+
+Nothing prevents a authenticated user (or someone who steals a token) from hammering `POST /api/v1/scans` or listing endpoints thousands of times per second. This could overload workers, external scanner APIs, or enrichment feeds.
+
+**Fix:** Add middleware like `slowapi` or a reverse-proxy rate limit (nginx, Cloudflare). Especially cap scan launch endpoints.
+
+### Bonus issues in the dashboard (not in original list but worth knowing)
+
+- **`POST /scans` sends wrong JSON** — sends a bare list `["192.168.1.0/24"]` instead of `{"targets": [...], "scanners": [...]}`.
+- **Severity values** — dashboard filters `"Critical"` but the API uses uppercase `"CRITICAL"`.
+- **Missing fields** — dashboard expects `scan_timestamp` which doesn't exist on API responses.
+- **Dashboard not in docker-compose** — the `dashboard/` folder exists but isn't started by `docker compose up`.
+
+---
+
+## SECTION 11: HOW TO ACTUALLY RUN THIS LOCALLY
+
+Assumptions: you have **Docker Desktop** installed and running on Windows. Nothing else required.
+
+### Step 1 — Open a terminal in the project folder
+
+```powershell
+cd "C:\Users\SOUHA-PC\OneDrive\Desktop\python cs50\vuln_aggregator"
+```
+
+This moves you into the project root where `docker-compose.yml` lives.
+
+### Step 2 — Copy the environment file (if you haven't already)
+
+```powershell
+copy .env.example .env
+```
+
+Creates your local config from the template. You can edit `.env` in Notepad later to change passwords or scan targets. For first run, defaults are fine.
+
+### Step 3 — Build and start everything
+
+```powershell
+docker compose up --build
+```
+
+What this does:
+
+- **`--build`** — Builds the Python Docker image from the `Dockerfile`.
+- **`up`** — Starts postgres, redis, api, worker, and beat containers.
+- You'll see lots of log output. Wait until you see uvicorn reporting `Application startup complete`.
+
+First boot takes a few minutes (downloading images, pip install). Later starts are faster.
+
+### Step 4 — Verify the API is alive
+
+Open a browser to:
+
+**http://localhost:8000/health**
+
+You should see:
+
+```json
+{"status": "ok"}
+```
+
+That's the public health check from `src/api/main.py`. No login needed.
+
+### Step 5 — Open the interactive API docs
+
+**http://localhost:8000/docs**
+
+This is Swagger UI — a web page that lists every endpoint, lets you try them, and shows request/response shapes. Very useful for learning.
+
+### Step 6 — Log in and get a token
+
+In Swagger UI:
+
+1. Find `POST /api/v1/auth/token`.
+2. Click "Try it out."
+3. Enter username `analyst`, password `analyst123`.
+4. Execute.
+
+You'll get JSON like:
+
+```json
+{
+  "access_token": "eyJ...",
+  "token_type": "bearer",
+  "expires_in": 3600
+}
+```
+
+Copy the `access_token` value.
+
+### Step 7 — Authorize Swagger
+
+Click the **Authorize** button (lock icon, top right). Paste:
+
+```
+Bearer eyJ...your-token-here...
+```
+
+Now authenticated endpoints will include your token automatically.
+
+### Step 8 — Try listing vulnerabilities (empty at first)
+
+`GET /api/v1/vulnerabilities` → should return:
+
+```json
+{"items": [], "count": 0, "next_cursor": null, "has_more": false}
+```
+
+Empty is normal. No scans have completed yet.
+
+### Step 9 — (Optional) Launch a scan
+
+`POST /api/v1/scans` with body:
+
+```json
+{
+  "targets": ["127.0.0.1"],
+  "scanners": ["gvm"]
+}
+```
+
+You'll get HTTP 202 with a job id. Poll `GET /api/v1/scans/{job_id}` to watch status move from PENDING → RUNNING → COMPLETED (or FAILED).
+
+### What will fail without real scanner credentials — and that's okay
+
+The API, database, Redis, Celery worker, and beat scheduler all work without GVM or Nessus configured. You'll see:
+
+- **GVM scans fail** if `GVM_HOST`, credentials, or the GVM container aren't reachable. The worker logs a warning and the job may end as FAILED.
+- **Nessus scans fail** if `NESSUS_ACCESS_KEY` and `NESSUS_SECRET_KEY` are empty (default in `.env`).
+- **Trivy scans fail** if the `trivy` binary isn't installed inside the worker container (it's not in the Dockerfile by default).
+
+Enrichment *can* work for real CVEs if the worker container has internet access — KEV and EPSS are public feeds with no API key required.
+
+To test without scanners, run the unit tests instead:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+pip install pytest pytest-asyncio httpx aiosqlite
+python -m pytest -q
+```
+
+You should see `21 passed`.
+
+### Stop everything
+
+Press `Ctrl+C` in the terminal, then:
+
+```powershell
+docker compose down
+```
+
+Add `-v` if you want to wipe the Postgres data volume too.
+
+---
+
+## SECTION 12: WHAT TO READ NEXT (A LEARNING PATH)
+
+If you want to genuinely understand and extend this project, here's a sensible order.
+
+### 1. Basic Python
+
+**Learn:** Variables, functions, lists, dicts, classes, imports, virtual environments.
+
+**Unlocks in this codebase:** Reading any file. Understanding `NormalizedVulnerability` fields, config parsing, and test fixtures.
+
+**Resource:** Official Python tutorial at docs.python.org — "Tutorial" section.
+
+### 2. Async Python (`async` / `await`)
+
+**Learn:** Coroutines, `asyncio.gather`, why `await` doesn't block the whole program, event loops.
+
+**Unlocks:** Understanding `ScanService._collect()`, enrichment concurrency, database sessions, and why Celery tasks call `asyncio.run()`.
+
+**Resource:** Real Python's "Async IO in Python" guide.
+
+### 3. HTTP and REST basics
+
+**Learn:** HTTP methods (GET, POST), status codes (200, 401, 403, 404, 202), headers, JSON request bodies.
+
+**Unlocks:** Understanding every file in `src/api/routes/`, why the dashboard's old `/findings` call fails, and how to use Swagger UI.
+
+**Resource:** MDN Web Docs "HTTP overview."
+
+### 4. FastAPI
+
+**Learn:** Path operations, dependency injection (`Depends`), Pydantic request models, automatic OpenAPI docs.
+
+**Unlocks:** Adding new endpoints, understanding `src/api/deps.py`, modifying auth behavior, extending schemas.
+
+**Resource:** fastapi.tiangolo.com — follow the tutorial through "Dependencies."
+
+### 5. SQLAlchemy 2.0 (async)
+
+**Learn:** Engines, sessions, `select()` queries, ORM mapped columns, async session context managers.
+
+**Unlocks:** Modifying `VulnerabilityRow`, writing new repository queries, understanding upsert logic.
+
+**Resource:** docs.sqlalchemy.org — "ORM Quickstart" and "Asyncio" section.
+
+### 6. Pydantic v2
+
+**Learn:** `BaseModel`, field validators, computed fields, `ConfigDict`.
+
+**Unlocks:** Domain models in `src/models/`, API schemas in `src/api/schemas.py`, settings in `src/config.py`.
+
+**Resource:** docs.pydantic.dev — "Models" and "Settings Management."
+
+### 7. Docker basics
+
+**Learn:** Images, containers, docker-compose services, volumes, port mapping, environment variables.
+
+**Unlocks:** Understanding `docker-compose.yml`, debugging startup failures, adding Trivy to the worker image.
+
+**Resource:** Docker's "Getting Started" guide at docs.docker.com.
+
+### 8. Celery
+
+**Learn:** Tasks, brokers, workers, beat schedules, `.delay()` vs `.apply_async()`.
+
+**Unlocks:** Understanding `src/workers/`, why scans don't block the API, how scheduled KEV refresh works.
+
+**Resource:** docs.celeryq.dev — "First Steps with Celery."
+
+### 9. The actual CISA KEV page
+
+**Learn:** What real-world entries look like, vendor names, due dates, ransomware campaigns.
+
+**Unlocks:** Context for why `is_known_exploited` is the most important boolean in the enrichment pipeline.
+
+**Resource:** cisa.gov/known-exploited-vulnerabilities-catalog
+
+### 10. Read the code in this order
+
+Once the above foundations are in place:
+
+1. `src/models/vulnerability.py` — the core data shape
+2. `src/engine/risk_engine.py` — the scoring recipe
+3. `src/connectors/base.py` + one connector (e.g. `nessus.py`)
+4. `src/services/scan_service.py` — the full pipeline
+5. `src/api/routes/scans.py` + `src/workers/tasks.py` — entry and background execution
+6. `src/enrichment/pipeline.py` — intel layer
+7. `src/database/repository.py` — persistence and pagination
+
+---
+
+## SECTION 13: A GLOSSARY OF EVERY IMPORT IN THE PROJECT
+
+Below: every **third-party** library imported in project source (excluding the Python standard library). One sentence each, plus which files use it.
+
+---
+
+**alembic** — Database migration runner that version-controls schema changes.  
+*Used in:* `alembic/env.py`, `alembic/versions/0001_initial.py`
+
+**celery** — Distributed task queue for background jobs.  
+*Used in:* `src/workers/celery_app.py`, `src/workers/tasks.py`
+
+**fastapi** — Modern async web framework powering the REST API.  
+*Used in:* `src/api/main.py`, `src/api/errors.py`, `src/api/deps.py`, `src/api/security.py`, all files in `src/api/routes/`
+
+**httpx** — Async-capable HTTP client for calling external APIs.  
+*Used in:* `src/connectors/nessus.py`, `src/enrichment/cisa_kev.py`, `src/enrichment/epss.py`, `src/enrichment/exploit_intel.py`, `src/tests/conftest.py`, `src/tests/integration/test_api.py`, `dashboard/app.py`
+
+**passlib** — Password hashing library (pbkdf2_sha256).  
+*Used in:* `src/api/security.py`
+
+**pydantic** — Data validation and settings via typed models.  
+*Used in:* `src/config.py`, `src/models/vulnerability.py`, `src/models/scan.py`, `src/api/schemas.py`, `src/api/errors.py`, `src/api/security.py`
+
+**pydantic-settings** — Loads Pydantic models from environment variables and `.env` files.  
+*Used in:* `src/config.py`
+
+**PyJWT** (imported as `jwt`) — Creates and verifies JSON Web Tokens.  
+*Used in:* `src/api/security.py`
+
+**pytest** — Test framework and assertion helpers.  
+*Used in:* `src/tests/conftest.py`, all files in `src/tests/unit/` and `src/tests/integration/`
+
+**pytest-asyncio** — Pytest plugin for testing async functions.  
+*Used in:* `src/tests/conftest.py` (`@pytest_asyncio.fixture`)
+
+**redis** (`redis.asyncio`) — Async Redis client for shared caching.  
+*Used in:* `src/enrichment/cache.py` (`RedisTTLCache`)
+
+**sqlalchemy** — Database engine, ORM, and query builder.  
+*Used in:* `src/database/base.py`, `src/database/orm.py`, `src/database/repository.py`, `alembic/env.py`, `alembic/versions/0001_initial.py`, `src/services/factory.py`, `src/api/deps.py`, `src/workers/tasks.py`
+
+**starlette** — ASGI toolkit underneath FastAPI; provides HTTP exceptions and responses.  
+*Used in:* `src/api/errors.py`
+
+**structlog** — Structured logging with JSON output and context binding.  
+*Used in:* `src/observability/logging.py`, `src/api/main.py`, `src/api/errors.py`, `src/services/scan_service.py`, `src/workers/tasks.py`, `src/observability/tracing.py`
+
+**tenacity** — Retry decorator with exponential backoff for flaky network calls.  
+*Used in:* `src/connectors/gvm.py`, `src/connectors/nessus.py`, `src/enrichment/cisa_kev.py`, `src/enrichment/epss.py`, `src/enrichment/exploit_intel.py`
+
+---
+
+### Optional / conditional imports (not always installed)
+
+**python-gvm** (imported as `gvm`) — Official Greenbone GMP protocol client.  
+*Used in:* `src/connectors/gvm.py` (lazy import inside `_connect()` — fails gracefully if not installed)
+
+**opentelemetry-sdk, opentelemetry-instrumentation-fastapi, opentelemetry-exporter-otlp-proto-http** — Distributed tracing instrumentation.  
+*Used in:* `src/observability/tracing.py` (wrapped in try/except ImportError — silently skipped if missing)
+
+---
+
+### Test-only third-party imports
+
+**aiosqlite** — Async SQLite driver (not imported directly; used via SQLAlchemy URL `sqlite+aiosqlite:///` in tests).  
+*Used by:* `src/tests/conftest.py` test database fixture
+
+---
+
+### Dashboard-only third-party imports (separate from main app)
+
+**streamlit** — Quick web UI framework for data dashboards.  
+*Used in:* `dashboard/app.py`
+
+**pandas** — Data analysis library for tables and charts.  
+*Used in:* `dashboard/app.py`
+
+---
+
+### Referenced in Docker/requirements but not directly imported in Python source
+
+**uvicorn** — ASGI server that runs the FastAPI app.  
+*Used via:* Docker `command:` in `docker-compose.yml`, not imported in `.py` files
+
+**asyncpg** — Async PostgreSQL driver.  
+*Used via:* SQLAlchemy connection URL `postgresql+asyncpg://...` in production settings
+
+**python-multipart** — Parses HTML form data for OAuth2 login.  
+*Used via:* FastAPI's `OAuth2PasswordRequestForm` dependency (requires this package installed)
+
+---
+
+## Closing thoughts
+
+You made it through the whole guide. That is not a small thing — this project touches networking, security scoring, government threat feeds, async Python, databases, message queues, and authenticated APIs.
+
+You don't need to memorize every file. Keep this document nearby. When you see an unfamiliar word, check Section 2. When you wonder "what runs when I click scan," check Section 5. When something breaks, check Section 10.
+
+The code is organized so that each piece has one job. That makes it learnable — one layer at a time.
+
+Welcome to vuln_aggregator. Go break things in a test environment first.

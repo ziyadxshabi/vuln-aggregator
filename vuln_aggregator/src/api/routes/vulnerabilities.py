@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 
 from src.api.deps import VulnRepoDep
 from src.api.errors import NotFoundError
+from src.api.rate_limit import limiter
 from src.api.schemas import VulnerabilityListResponse, VulnerabilityResponse
 from src.api.security import AuthUser, get_current_user
 from src.models.enums import Severity
@@ -16,7 +17,9 @@ router = APIRouter(prefix="/vulnerabilities", tags=["vulnerabilities"])
 
 
 @router.get("", response_model=VulnerabilityListResponse)
+@limiter.limit("120/minute")
 async def list_vulnerabilities(
+    request: Request,
     vuln_repo: VulnRepoDep,
     _user: Annotated[AuthUser, Depends(get_current_user)],
     cursor: Annotated[str | None, Query(description="Opaque pagination cursor")] = None,
@@ -47,7 +50,9 @@ async def list_vulnerabilities(
 
 
 @router.get("/{vuln_id}", response_model=VulnerabilityResponse)
+@limiter.limit("120/minute")
 async def get_vulnerability(
+    request: Request,
     vuln_id: str,
     vuln_repo: VulnRepoDep,
     _user: Annotated[AuthUser, Depends(get_current_user)],

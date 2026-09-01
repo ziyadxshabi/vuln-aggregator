@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 from src.connectors.gvm import normalize_report as gvm_normalize
 from src.connectors.nessus import normalize_report as nessus_normalize
 from src.connectors.trivy import normalize_report as trivy_normalize
 from src.models.enums import Severity
 from src.models.vulnerability import fingerprint
-from tests.conftest import load_fixture
+
+_conftest_path = Path(__file__).resolve().parent.parent / "conftest.py"
+_spec = importlib.util.spec_from_file_location("unit_conftest", _conftest_path)
+_conftest = importlib.util.module_from_spec(_spec)
+assert _spec.loader is not None
+_spec.loader.exec_module(_conftest)
+load_fixture = _conftest.load_fixture
 
 
 def test_gvm_normalization() -> None:

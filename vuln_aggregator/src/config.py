@@ -9,8 +9,10 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Annotated
 
-from pydantic import Field, computed_field, field_validator
+from pydantic import Field, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+_DEFAULT_JWT_SECRET = "dev-only-secret-change-me-0123456789abcdef"
 
 
 class Settings(BaseSettings):
@@ -41,7 +43,7 @@ class Settings(BaseSettings):
     celery_result_backend: str | None = Field(default=None)
 
     # --- JWT / Auth ------------------------------------------------------
-    jwt_secret: str = Field(default="dev-only-secret-change-me-0123456789abcdef")
+    jwt_secret: str = Field(default=_DEFAULT_JWT_SECRET)
     jwt_algorithm: str = Field(default="HS256")
     access_token_expire_minutes: int = Field(default=60)
 
@@ -94,6 +96,14 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @model_validator(mode="after")
+    def _validate_jwt_secret(self) -> Settings:
+        if len(self.jwt_secret) < 32:
+            raise ValueError("JWT_SECRET must be at least 32 characters")
+        if self.environment == "production" and self.jwt_secret == _DEFAULT_JWT_SECRET:
+            raise ValueError("JWT_SECRET must be changed from the default value in production")
+        return self
 
     @computed_field  # type: ignore[prop-decorator]
     @property

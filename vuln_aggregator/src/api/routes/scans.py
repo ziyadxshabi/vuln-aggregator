@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Request, status
 
 from src.api.deps import DispatcherDep, JobRepoDep
 from src.api.errors import NotFoundError
+from src.api.rate_limit import limiter
 from src.api.schemas import ScanJobResponse, ScanRequest
 from src.api.security import AuthUser, get_current_user, require_roles
 from src.models.enums import Role
@@ -16,7 +17,9 @@ router = APIRouter(prefix="/scans", tags=["scans"])
 
 
 @router.post("", response_model=ScanJobResponse, status_code=status.HTTP_202_ACCEPTED)
+@limiter.limit("120/minute")
 async def launch_scan(
+    request: Request,
     payload: ScanRequest,
     job_repo: JobRepoDep,
     dispatcher: DispatcherDep,
@@ -29,7 +32,9 @@ async def launch_scan(
 
 
 @router.get("/{task_id}", response_model=ScanJobResponse)
+@limiter.limit("120/minute")
 async def get_scan(
+    request: Request,
     task_id: str,
     job_repo: JobRepoDep,
     _user: Annotated[AuthUser, Depends(get_current_user)],

@@ -130,8 +130,9 @@ FINDING
   One scan of a network can produce hundreds of findings.
 
 THREAT INTELLIGENCE
-  Extra facts from outside your network. Here that source is Vulners:
-  "does this CVE have exploits? what is the EPSS? any extra references?"
+  Extra facts from outside your network. This project uses three feeds:
+  CISA KEV (actively exploited CVEs), FIRST EPSS (exploitation probability),
+  and NVD/Vulners via ExploitIntelClient (CVSS v3.1 vectors and exploit signals).
 
 
 ================================================================
@@ -164,15 +165,17 @@ API (Application Programming Interface)
   for machines. You send a request, you get data back (usually JSON).
 
   This project:
-    - CALLS APIs of GVM, Nessus, and Vulners
+    - CALLS APIs of GVM, Nessus, CISA KEV, FIRST EPSS, and NVD/Vulners
     - PROVIDES its own API so the dashboard (or you) can start scans and
       read findings
 
 REST API
   A common style of HTTP API. You will see:
-    POST /scans              start a scan
-    GET  /findings           list findings
-    GET  /findings/{id}      one finding
+    POST /api/v1/scans              start a scan (async)
+    GET  /api/v1/vulnerabilities    list findings
+    GET  /api/v1/vulnerabilities/{id}  one finding
+    GET  /api/v1/metrics/posture    security posture summary
+    POST /api/v1/auth/token         log in and get a JWT
   GET means "read". POST means "do something / send data".
 
 JSON
@@ -236,15 +239,14 @@ Here is the full journey of one scan, in order.
 STEP A. Someone (or the clock) says "scan these targets"
   Sources:
     - You click "Trigger New Scan" on the dashboard
-    - You POST to /scans on the API
-    - The scheduler wakes up every SCAN_SCHEDULE_HOURS hours (default 6)
+    - You POST to /api/v1/scans on the API
+    - Celery Beat wakes up every SCAN_SCHEDULE_HOURS hours (default 6)
 
-STEP B. The Orchestrator takes over  (src/orchestrator.py)
-  This is the project manager.
-  For every target, it starts TWO scans at the same time:
-    - GVMConnector.scan_target(target)
-    - NessusConnector.scan_target(target)
-  asyncio.gather waits until both finish (or fail). If one scanner crashes,
+STEP B. ScanService takes over  (src/services/scan_service.py)
+  This is the project manager. A Celery worker runs ScanService.execute().
+  For every (scanner, target) pair, it calls the connector's three-step
+  lifecycle: start_scan -> poll -> fetch_and_normalize.
+  asyncio.gather waits until all finish (or fail). If one scanner crashes,
   the other scanner's results are still kept.
 
 STEP C. Each connector talks to its scanner
@@ -257,23 +259,24 @@ STEP C. Each connector talks to its scanner
     create a scan -> launch it -> poll until completed (max 1 hour) ->
     fetch details -> turn JSON into Vulnerability objects
 
-  Both connectors output the SAME Python object type: Vulnerability.
+  Both connectors output the SAME Python object type: NormalizedVulnerability.
   That translation is called "normalization". Without it, you would have
   two incompatible report formats forever.
 
-STEP D. Enrichment via Vulners  (src/connectors/vulners_connector.py)
-  For every finding that has a CVE ID, the orchestrator asks Vulners:
-    - Are there known exploits?
-    - What is the EPSS score?
-    - Extra references / better CVSS numbers
+STEP D. Enrichment via threat-intel pipeline  (src/enrichment/pipeline.py)
+  For every finding that has a CVE ID, EnrichmentPipeline queries:
+    - CISA KEV: is this CVE actively exploited in the wild?
+    - FIRST EPSS: exploitation probability and percentile
+    - NVD/Vulners (ExploitIntelClient): CVSS v3.1 vector and exploit signals
   Findings without a CVE skip this step.
 
-STEP E. Risk score  (src/risk_engine.py)
+STEP E. Risk score  (src/engine/risk_engine.py)
   Each finding gets a number 0-10:
-    - 50% from CVSS (prefer v3, else v2, else a guess from Low/Medium/High)
-    - 30% from EPSS
-    - +1.5 if an exploit exists
-    - then multiplied by asset_criticality (currently always 1.0)
+    - 40% from CVSS (prefer v3, else v2, else severity fallback)
+    - 30% from EPSS (stretched to 0-10 scale)
+    - 15% if a weaponized public exploit exists
+    - KEV override: +1.5 boost and floor of 9.0 if on CISA KEV list
+    - then multiplied by asset_criticality (0.5x to 1.5x; default 1.0)
   The score is capped at 10.
 
 STEP F. Deduplicate this batch
@@ -287,9 +290,9 @@ STEP G. Save to PostgreSQL
   That is why rerunning scans does not flood the table with clones.
 
 STEP H. You look at the results
-  - Dashboard: http://localhost:8501  (charts, top 10, trigger scan)
+  - Dashboard: Streamlit UI (dashboard/app.py) — log in, then view findings
   - API docs:  http://localhost:8000/docs  (interactive "try it" page)
-  - GET /findings returns the worst findings first (highest risk_score)
+  - GET /api/v1/vulnerabilities returns the worst findings first (highest risk_score)
 
 
 ================================================================
@@ -306,13 +309,13 @@ vuln_aggregator/
 |-- docker-compose.yml
 |     The "start the whole factory" file. It boots:
 |       postgres   = the database
-|       redis      = optional cache (configured, not heavily used yet)
+|       redis      = Celery broker and enrichment cache
 |       api        = FastAPI web service
-|       scheduler  = automatic repeating scans
-|       dashboard  = Streamlit website
+|       worker     = Celery worker that runs scans
+|       beat       = Celery Beat scheduler (repeating scans + KEV refresh)
 |
 |-- Dockerfile
-|     Recipe for building the API / scheduler Python image.
+|     Recipe for building the API / worker Python image.
 |
 |-- requirements.txt
 |     List of Python libraries the backend needs (FastAPI, SQLAlchemy, ...).
@@ -325,31 +328,49 @@ vuln_aggregator/
 |
 |-- src/                         THE BRAIN
 |   |-- config.py                Reads .env into a Settings object
-|   |-- models.py                The common "Vulnerability" form + ID helper
-|   |-- database.py              PostgreSQL table definition and connection
-|   |-- orchestrator.py          The project manager (scan, enrich, store)
-|   |-- risk_engine.py           The 0-10 scoring formula
-|   |-- scheduler.py             Alarm clock: scan every N hours
+|   |-- models/                  Domain models, enums, ports (interfaces)
+|   |-- engine/risk_engine.py    The 0-10 scoring formula
+|   |-- services/
+|   |     scan_service.py        The project manager (scan, enrich, store)
+|   |     posture_service.py     Posture metrics read model
+|   |     factory.py             Wires adapters into ScanService
+|   |-- workers/
+|   |     celery_app.py          Celery app + beat schedule
+|   |     tasks.py               Background scan and KEV refresh tasks
+|   |     dispatcher.py          Enqueues scans onto Celery
 |   |
 |   |-- connectors/              TRANSLATORS TO OUTSIDE TOOLS
 |   |     base.py                The contract every scanner must follow
-|   |     gvm_connector.py       Talks to Greenbone / OpenVAS
-|   |     nessus_connector.py    Talks to Nessus
-|   |     vulners_connector.py   Talks to Vulners threat intel
+|   |     gvm.py                 Talks to Greenbone / OpenVAS
+|   |     nessus.py              Talks to Nessus
+|   |     trivy.py               Talks to Trivy (containers)
+|   |
+|   |-- enrichment/              THREAT INTELLIGENCE
+|   |     pipeline.py            Coordinates KEV + EPSS + NVD/Vulners
+|   |     cisa_kev.py            CISA Known Exploited Vulnerabilities
+|   |     epss.py                FIRST EPSS client
+|   |     exploit_intel.py       NVD and optional Vulners lookups
+|   |     cache.py               Redis/in-memory TTL cache
+|   |
+|   |-- database/                PERSISTENCE
+|   |     base.py                Async engine and sessions
+|   |     orm.py                 SQLAlchemy table definitions
+|   |     repository.py          Upsert, pagination, posture queries
 |   |
 |   |-- api/                     THE DOOR TO THE OUTSIDE WORLD
-|   |     main.py                Starts FastAPI, creates DB tables on boot
-|   |     routes.py              The actual URLs: /scans and /findings
+|   |     main.py                Starts FastAPI, rate limiting, lifespan
+|   |     routes/                /api/v1/auth, scans, vulnerabilities, metrics
+|   |     security.py            JWT auth and RBAC
 |   |
-|   |-- utils/
+|   |-- observability/
 |         logging.py             Structured JSON logs
 |
 |-- dashboard/
-|     app.py                     Streamlit UI (metrics, charts, button)
-|     Dockerfile / requirements.txt
+|     app.py                     Streamlit UI (login, metrics, charts, scan button)
+|     requirements.txt
 |
-|-- tests/
-      Empty package for future tests.
+|-- src/tests/
+      Unit and integration tests (risk engine, normalization, API, upsert).
 
 
 ================================================================
@@ -357,11 +378,11 @@ vuln_aggregator/
 ================================================================
 
 Every finding, no matter which scanner found it, is squeezed into this
-shape (src/models.py). That is the whole point of "unified".
+shape (src/models/vulnerability.py). That is the whole point of "unified".
 
   id                 Fingerprint so the same issue stays one row
   cve_id             Public catalog number, if known
-  scanner            "gvm" or "nessus"
+  scanner            "gvm", "nessus", or "trivy"
   scanner_vuln_id    That scanner's own ID for the check (plugin / NVT)
   asset_host         Hostname you asked to scan
   asset_ip           IP where it was found
@@ -380,8 +401,8 @@ shape (src/models.py). That is the whole point of "unified".
   tags               Extra labels (mostly unused for now)
 
 THE STABLE ID
-  generate_vuln_id() hashes:
-      scanner + scanner_vuln_id + asset_ip + port
+  fingerprint() hashes:
+      scanner + scanner_vuln_id + asset_ip + port + protocol
   Same inputs always produce the same id. That is how upserts work.
 
   Example meaning: "Nessus plugin 12345 on 192.168.1.10 port 443" is always
@@ -395,10 +416,11 @@ THE STABLE ID
 GVM and Nessus are different products.
 
   - GVM speaks GMP and returns XML.
-  - Nessus speaks HTTP JSON (via the nessrest library).
-  - Vulners is not a scanner; it is a lookup service for CVE intel.
+  - Nessus speaks HTTP JSON via httpx.
+  - Trivy is a CLI that outputs JSON for container images.
+  - CISA KEV, FIRST EPSS, and NVD/Vulners are enrichment feeds, not scanners.
 
-If the rest of the app had to know XML vs JSON, the orchestrator would
+If the rest of the app had to know XML vs JSON vs CLI output, ScanService would
 become a mess. So each connector hides the ugly details.
 
 base.py says: "If you want to be a scanner here, you MUST implement
@@ -421,31 +443,33 @@ NESSUS POLLING
 9. RISK SCORING, WITH A TINY EXAMPLE
 ================================================================
 
-Formula (simplified):
+Formula (from src/engine/risk_engine.py):
 
-  cvss_part     = CVSS * 0.5          (uses v3 if present, else v2)
-  epss_part     = EPSS * 10 * 0.3     (EPSS 0.2 contributes 0.6)
-  exploit_bonus = 1.5 if exploit else 0
-  score         = min(cvss_part + epss_part + exploit_bonus, 10)
-  final         = min(score * asset_criticality, 10)
+  cvss_part     = CVSS * 0.40          (uses v3 if present, else v2, else severity fallback)
+  epss_part     = EPSS * 10 * 0.30     (EPSS 0.5 contributes 1.5)
+  exploit_part  = 10 * 0.15 if weaponized exploit else 0   (= 1.5 when present)
+  base          = cvss_part + epss_part + exploit_part
+  kev_boost     = if on CISA KEV: max(base + 1.5, 9.0) else base
+  final         = min(kev_boost * asset_criticality, 10)
 
 Example finding:
   CVSS v3 = 8.0
   EPSS    = 0.5   (50% chance of exploitation, quite high)
-  exploit exists
+  weaponized exploit exists
+  not on KEV list
   asset_criticality = 1.0
 
-  cvss_part     = 8.0 * 0.5 = 4.0
-  epss_part     = 0.5 * 10 * 0.3 = 1.5
-  exploit_bonus = 1.5
-  total         = 7.0
+  cvss_part     = 8.0 * 0.40 = 3.2
+  epss_part     = 0.5 * 10 * 0.30 = 1.5
+  exploit_part  = 1.5
+  total         = 6.2
 
-That 7.0 is more useful than "High" because it mixes "how bad" with
+That 6.2 is more useful than "High" because it mixes "how bad" with
 "how likely attackers will actually use this".
 
-If the scanner gave no CVSS, the code maps:
-  Low=2.0, Medium=5.0, High=7.5, Critical=9.5
-and then still applies the 50% weight.
+If the scanner gave no CVSS, the code maps severity baselines:
+  INFO=0.0, LOW=3.0, MEDIUM=5.5, HIGH=8.0, CRITICAL=9.5
+and then still applies the 40% weight.
 
 
 ================================================================
@@ -454,32 +478,38 @@ and then still applies the 50% weight.
 
 API (src/api/)
   FastAPI is a Python framework that turns functions into HTTP endpoints.
+  All routes live under /api/v1/ and require JWT auth except /health.
 
-  POST /scans
-    Body: a list of targets, e.g. ["192.168.1.0/24"]
-    It does NOT wait for the scan to finish (scans can take a long time).
-    It starts the work in the background and immediately replies
-    { "status": "started", "targets": [...] }.
+  POST /api/v1/auth/token
+    Form-encoded username/password. Returns a JWT access token.
 
-  GET /findings?severity=High&limit=100
-    Reads the database. Optional filter by severity. Sorted worst-first.
+  POST /api/v1/scans
+    Body: {"targets": ["192.168.1.0/24"], "scanners": ["gvm", "nessus"]}
+    Returns HTTP 202 immediately with a job id. Scan runs in Celery worker.
 
-  GET /findings/{id}
+  GET /api/v1/vulnerabilities?severity=HIGH&limit=100
+    Reads the database. Optional filters. Sorted worst-first (risk_score desc).
+
+  GET /api/v1/vulnerabilities/{id}
     One finding, or HTTP 404 if that id does not exist.
 
-  On startup, main.py runs init_db() so the vulnerabilities table exists.
+  GET /api/v1/metrics/posture
+    Aggregated posture: severity counts, KEV exposure, MTTR, exposure score.
+
+  On startup, main.py runs Alembic migrations (in Docker) or create_all (dev).
 
   Open http://localhost:8000/docs for a clickable manual (Swagger UI).
 
 DASHBOARD (dashboard/app.py)
   Streamlit is a Python library that turns a script into a simple website.
   It calls the API (http://api:8000 when running inside Docker).
+  You must log in first (sidebar) — default dev user: analyst / analyst123.
 
   You see:
-    - total findings, count of Critical, count of High, average risk
+    - security posture metrics from /api/v1/metrics/posture
+    - total findings, count of CRITICAL, count of HIGH, average risk
     - top 10 by risk_score
     - a bar chart of severity
-    - a line chart of findings per day
     - a button that POSTs a scan of 192.168.1.0/24
 
   Results are cached for 300 seconds so the page does not hammer the API
@@ -487,22 +517,20 @@ DASHBOARD (dashboard/app.py)
 
 
 ================================================================
-11. THE SCHEDULER (THE ALARM CLOCK)
+11. CELERY BEAT (THE ALARM CLOCK)
 ================================================================
 
-src/scheduler.py uses APScheduler.
+src/workers/celery_app.py configures Celery Beat with two scheduled tasks:
 
-When the scheduler container starts, it:
-  1. Runs a scan immediately
-  2. Repeats every SCAN_SCHEDULE_HOURS hours
+  intel.refresh_kev   — re-downloads the CISA KEV catalog (default every 24h)
+  scans.scheduled     — runs an estate scan of SCAN_TARGETS (default every 6h)
 
-It reads SCAN_TARGETS from .env, then calls the same Orchestrator.scan_targets
-that the API uses. So "click the button" and "wait for the clock" share one
-brain.
+The beat container starts the scheduler. The worker container executes tasks.
+Both share the same ScanService brain as the API — API enqueues via
+CeleryTaskDispatcher; beat triggers scheduled_scan_task directly.
 
-docker-compose waits until Postgres is healthy before starting the
-scheduler, so it does not try to write findings into a database that is
-still booting.
+docker-compose waits until Postgres and Redis are healthy before starting
+worker and api, so they do not write findings into services still booting.
 
 
 ================================================================
@@ -517,10 +545,10 @@ Docker starts five services:
 
   postgres     Stores findings. Data lives in a volume named postgres_data
                so it survives container restarts.
-  redis        A fast in-memory store. Wired in config as REDIS_URL.
+  redis        Celery broker and enrichment TTL cache.
   api          The FastAPI app on port 8000 (your PC: http://localhost:8000).
-  scheduler    Background worker that triggers scans on a timer.
-  dashboard    Streamlit on port 8501 (http://localhost:8501).
+  worker       Celery worker that runs scan and enrichment tasks.
+  beat         Celery Beat scheduler for KEV refresh and estate scans.
 
 "Port 8000:8000" means: the program inside the box listens on 8000, and
 your Windows browser can reach it at localhost:8000.
@@ -528,9 +556,9 @@ your Windows browser can reach it at localhost:8000.
 The api service mounts ./src into the container so code changes can reload
 without a full rebuild (--reload).
 
-You still need REAL scanner credentials in .env. Without a live GVM/Nessus
-and a Vulners API key, scans will fail when they try to connect. The rest
-of the stack (API + empty database + dashboard) can still start.
+You still need REAL scanner credentials in .env. Without a live GVM/Nessus/Trivy,
+scans will fail when they try to connect. KEV and EPSS enrichment work without
+keys. The rest of the stack (API + database + worker) can still start.
 
 
 ================================================================
@@ -544,7 +572,7 @@ of the stack (API + empty database + dashboard) can still start.
       Your Nessus (or Tenable) API access.
 
   VULNERS_API_KEY
-      Key for exploit / EPSS lookups.
+      Optional key for extra exploit intel via Vulners (NVD works without it).
 
   POSTGRES_*
       Database login. The docker-compose defaults match the example:
@@ -554,7 +582,7 @@ of the stack (API + empty database + dashboard) can still start.
       Comma-separated list of IPs, hostnames, or subnets to scan.
 
   SCAN_SCHEDULE_HOURS
-      How often the scheduler repeats (default 6).
+      How often Celery Beat repeats estate scans (default 6).
 
   API_HOST / API_PORT
       Where FastAPI listens (0.0.0.0 means "all interfaces", port 8000).
@@ -618,9 +646,9 @@ disappears or its details get refreshed.
   - It is not a replacement for GVM or Nessus. It sits ON TOP of them.
   - It does not (yet) log in users, send Slack alerts, or store how
     important each asset is. Those are listed as future extensions.
-  - Redis is included in compose but the core flow does not depend on it
-    for scoring or storage.
-  - tests/ is a placeholder; there is no full automated test suite yet.
+  - Redis is used as Celery broker and enrichment cache.
+  - tests/ under src/tests/ has unit and integration tests; enrichment
+    pipeline tests were added in test_enrichment.py.
 
 
 ================================================================
@@ -630,15 +658,15 @@ disappears or its details get refreshed.
   You / Clock / Dashboard button
               |
               v
-         Orchestrator
-          /         \
-       GVM          Nessus          <- scanners look at your network
-          \         /
-           findings (same format)
+         ScanService (via Celery worker)
+          /    |    \
+       GVM   Nessus  Trivy           <- scanners look at your network
+          \    |    /
+           findings (NormalizedVulnerability)
                 |
-             Vulners                <- extra intel about CVEs
+    CISA KEV + EPSS + NVD/Vulners    <- threat intel enrichment
                 |
-           Risk engine              <- 0-10 score
+           Risk engine                <- 0-10 score
                 |
            Dedup + Database
                 |
@@ -647,10 +675,10 @@ disappears or its details get refreshed.
 
 If you remember only one sentence:
 
-  This app runs two vulnerability scanners together, translates their
-  reports into one language, adds exploit intel, scores each finding,
-  stores it, and shows you what to fix first.
+  This app runs multiple vulnerability scanners together, translates their
+  reports into one language, enriches with KEV/EPSS/NVD intel, scores each
+  finding, stores it, and shows you what to fix first.
 
 Welcome to the intersection of Python, networking, and defensive security.
 You are not expected to understand every library on day one. Follow one
-finding through orchestrator.py and you will understand the whole system.
+finding through scan_service.py and you will understand the whole system.

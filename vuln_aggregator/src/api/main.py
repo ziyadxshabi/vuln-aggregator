@@ -8,8 +8,12 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, Request, Response
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from src.api.errors import install_error_handlers
+from src.api.rate_limit import limiter
 from src.api.routes import api_v1
 from src.config import Settings, get_settings
 from src.database.base import Database
@@ -47,6 +51,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = resolved
+    app.state.limiter = limiter
+
+    # Rate limiting: caps requests per client IP to reduce brute-force and abuse.
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
 
     install_error_handlers(app)
 
