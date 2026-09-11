@@ -10,12 +10,13 @@
 #   test        - Install test deps and run pytest suite
 #   token       - Get a JWT token for analyst/analyst123
 #   scan-nginx  - Launch a Trivy scan of nginx:1.19
+#   scan-lan    - Launch a detection-only nmap+nuclei scan of 192.168.1.0/24
 #   findings    - Fetch top 10 vulnerability findings
 #   posture     - Fetch security posture metrics
 #   health      - Check API health endpoint
 #   clean       - Stop services and delete all data volumes
 
-.PHONY: up down logs logs-api logs-worker test token scan-nginx findings posture health clean
+.PHONY: up down logs logs-api logs-worker test token scan-nginx scan-lan findings posture health clean
 
 up:
 	docker compose up --build
@@ -33,7 +34,7 @@ logs-worker:
 	docker compose logs -f worker
 
 test:
-	cd vuln_aggregator && pip install aiosqlite pytest pytest-asyncio httpx && pytest src/tests/ -v
+	pip install aiosqlite pytest pytest-asyncio httpx && pytest src/tests/ -v
 
 token:
 	@echo "Getting analyst token..."
@@ -48,7 +49,18 @@ scan-nginx:
 	curl -s -X POST http://localhost:8000/api/v1/scans \
 		-H "Authorization: Bearer $$TOKEN" \
 		-H "Content-Type: application/json" \
-		-d '{"targets": ["nginx:1.19"], "scanners": ["trivy"]}' \
+		-d '{"targets": ["nginx:1.19"], "scanners": ["trivy"], "authorized": true}' \
+		| python3 -m json.tool
+
+scan-lan:
+	@echo "Launching detection-only scan of 192.168.1.0/24 (nmap + nuclei)..."
+	@TOKEN=$$(curl -s -X POST http://localhost:8000/api/v1/auth/token \
+		-d "username=analyst&password=analyst123" | python3 -c \
+		"import sys,json; print(json.load(sys.stdin)['access_token'])"); \
+	curl -s -X POST http://localhost:8000/api/v1/scans \
+		-H "Authorization: Bearer $$TOKEN" \
+		-H "Content-Type: application/json" \
+		-d '{"targets": ["192.168.1.0/24"], "profile": "home", "authorized": true}' \
 		| python3 -m json.tool
 
 findings:

@@ -8,8 +8,8 @@ from fastapi import FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.observability.logging import get_logger
 
@@ -54,9 +54,30 @@ class ForbiddenError(AppError):
     error_type = "permission_denied"
 
 
+class BadRequestError(AppError):
+    status_code = status.HTTP_400_BAD_REQUEST
+    error_type = "bad_request"
+
+
 class ValidationAppError(AppError):
     status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
     error_type = "validation_error"
+
+
+def _json_safe(value: Any) -> Any:
+    """Coerce Pydantic error payloads (which may contain Exception) into JSON."""
+    if isinstance(value, BaseException):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _serializable_error(err: dict[str, Any]) -> dict[str, Any]:
+    """Pydantic ctx.error can be a ValueError; JSON needs a string."""
+    return _json_safe(dict(err))
 
 
 def install_error_handlers(app: FastAPI) -> None:
@@ -93,7 +114,7 @@ def install_error_handlers(app: FastAPI) -> None:
                         type="validation_error",
                         message="Request validation failed",
                         request_id=_request_id(request),
-                        details=[dict(err) for err in exc.errors()],
+                        details=[_serializable_error(err) for err in exc.errors()],
                     )
                 )
             ),

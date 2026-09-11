@@ -9,9 +9,9 @@ from __future__ import annotations
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import Settings, get_settings
-from src.connectors import CONNECTOR_REGISTRY
+from src.connectors import CONNECTOR_REGISTRY, scanner_is_ready
 from src.connectors.base import BaseScannerConnector
-from src.database.repository import ScanJobRepository, VulnerabilityRepository
+from src.database.repository import AssetRepository, ScanJobRepository, VulnerabilityRepository
 from src.enrichment.cache import InMemoryTTLCache, RedisTTLCache
 from src.enrichment.pipeline import EnrichmentPipeline, build_default_pipeline
 from src.models.ports import CachePort
@@ -45,8 +45,11 @@ def build_scan_service(
     return ScanService(
         vuln_repo=VulnerabilityRepository(session, dialect_name),
         job_repo=ScanJobRepository(session),
+        asset_repo=AssetRepository(session, dialect_name),
         connectors=build_connectors(resolved),
         enrichment=enrichment,
+        allowlist=list(resolved.scan_allowlist),
+        scanner_ready=lambda name: scanner_is_ready(name, resolved),
         poll_interval_seconds=resolved.scan_poll_interval_seconds,
         poll_timeout_seconds=resolved.scan_poll_timeout_seconds,
     )

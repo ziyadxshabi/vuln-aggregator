@@ -86,3 +86,18 @@ class FindingStatus(str, Enum):
 
     OPEN = "OPEN"
     RESOLVED = "RESOLVED"
+
+
+class ScanProfile(str, Enum):
+    """Defensive scan intensity and host-cap preset."""
+
+    HOME = "home"
+    THOROUGH = "thorough"
+    LARGE = "large"
+
+
+class TargetKind(str, Enum):
+    """How a scan target is interpreted by the pipeline."""
+
+    NETWORK = "network"
+    IMAGE = "image"
