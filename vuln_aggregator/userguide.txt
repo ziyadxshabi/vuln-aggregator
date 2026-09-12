@@ -1,0 +1,368 @@
+USER GUIDE — Defensive Network Scanner
+======================================
+
+This is a detection-only scanner. Point it at a home LAN or other internal
+range you own (or have written permission to test). It finds live hosts with
+nmap, checks them with Nuclei (no exploit payloads), optionally scans a
+container image with Trivy, then ranks findings.
+
+It will refuse public internet ranges (for example 8.8.8.8) unless you
+explicitly add them to SCAN_ALLOWLIST. You must confirm authorization on
+every scan.
+
+Do not scan networks you do not own.
+
+
+0. What "it works" looks like
+-----------------------------
+
+There are two different questions:
+
+  A) Does the software run?  (Docker, API, worker, database, dashboard)
+  B) Did a real scan find hosts on MY network?
+
+A is proven by health checks + an image scan (nginx) + the automated tests.
+B depends on whether the scanner can reach your LAN. From Docker Compose the
+worker is on an isolated bridge, so 192.168.1.0/24 often returns zero hosts
+even if your Wi-Fi is full of devices. That is a network-reachability issue,
+not a broken scanner. The guide covers both: a reliable lab proof, then a
+real LAN scan.
+
+
+1. What you need
+----------------
+
+  - Docker and Docker Compose
+  - A terminal
+  - (Optional) a browser for the dashboard and Swagger docs
+  - (For a real LAN scan) a private CIDR you own, e.g. 192.168.1.0/24
+
+Clone / open the repo, then:
+
+  cd vuln_aggregator
+
+All commands below assume you are in that directory.
+
+
+2. Start it
+-----------
+
+  cp .env.example .env
+  docker compose up --build
+
+First build can take several minutes. The image installs nmap, Trivy, and
+Nuclei, and downloads Nuclei templates.
+
+Wait until the API log shows something like "Application startup complete"
+(or "startup_complete"). Then, in another terminal:
+
+  curl http://localhost:8000/health
+
+You want:
+
+  {"status":"ok"}
+
+Open:
+
+  Dashboard:  http://localhost:8501
+  API docs:   http://localhost:8000/docs
+
+Default lab logins (from .env AUTH_USERS):
+
+  analyst / analyst123   launch scans, mark findings resolved
+  viewer  / viewer123    read only
+  admin   / admin123     same as analyst for this app
+
+If health fails:  docker compose logs api
+If the dashboard cannot log in: the API is not up yet; wait and retry.
+
+
+3. Fastest proof the pipeline actually runs (image scan)
+--------------------------------------------------------
+
+This does not need your LAN. Trivy pulls nginx:1.19 and reports CVEs. If this
+works, Docker, the API, Celery worker, Postgres, and ranking are all alive.
+
+  make scan-nginx
+
+You should get HTTP 202 and JSON with:
+
+  "status": "PENDING"     (or already RUNNING)
+  "scanners": ["trivy"]
+  "authorized" is not echoed; the job was accepted because authorized=true
+  "id": "<hex job id>"
+
+Copy the "id" field. Poll until it finishes (30–90 seconds is typical the
+first time; Trivy may download the image):
+
+  TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/token \
+    -d "username=analyst&password=analyst123" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+  curl -s -H "Authorization: Bearer $TOKEN" \
+    http://localhost:8000/api/v1/scans/<PASTE_JOB_ID_HERE> | python3 -m json.tool
+
+Watch:
+
+  status            -> PENDING, then RUNNING, then COMPLETED
+  progress.phase    -> discovery / assessment / enrichment / complete
+  total_findings    -> a number greater than 0 for nginx:1.19
+  error             -> should be null
+
+Then:
+
+  make findings
+  make posture
+
+You want a list of CVEs with risk_score, and posture.total_findings > 0.
+
+In the dashboard: log in as analyst, open the Findings tab, click Refresh if
+needed. You should see ranked rows. That is a passing end-to-end test.
+
+If status is FAILED, read "error" and:
+
+  docker compose logs worker
+
+Common first-run issues: Trivy still pulling the image, or the worker
+container cannot reach the internet for GHCR/Docker Hub.
+
+
+4. Use the dashboard (the normal way)
+-------------------------------------
+
+  1. Open http://localhost:8501
+  2. Sidebar: username analyst, password analyst123, Login
+  3. Target: a private CIDR, IP, or image ref
+       examples:  192.168.1.0/24     (your LAN — see section 6)
+                  127.0.0.1          (loopback of the WORKER container)
+                  nginx:1.19         (image scan)
+  4. Profile: home  (use thorough only if you want default-login checks)
+  5. Check: "I am authorized to scan these targets"
+  6. Start scan
+  7. Click "Refresh progress" until status is COMPLETED
+  8. Hosts tab = live IPs and open ports
+  9. Findings tab = ranked issues; pick one and "Resolve selected finding"
+
+If you skip the checkbox, the UI blocks you. If the API is called with
+authorized=false, it returns HTTP 400.
+
+Profiles:
+
+  home      up to 256 hosts (a /24), top 1000 ports, safest Nuclei tags
+  thorough  up to 1024 hosts, also default-login templates
+  large     up to 4096 hosts, /24 chunks, fewer ports, slower rate
+
+A range bigger than the profile cap is rejected with HTTP 400.
+
+
+5. Same thing from the API / Makefile
+-------------------------------------
+
+Get a token (also: make token):
+
+  curl -s -X POST http://localhost:8000/api/v1/auth/token \
+    -d "username=analyst&password=analyst123" | python3 -m json.tool
+
+Launch a LAN-style job (change the CIDR to one you own):
+
+  make scan-lan
+
+That posts 192.168.1.0/24 with profile home and authorized true. If your LAN
+is a different prefix (10.0.0.0/24, 192.168.0.0/24, …), do not use the
+Makefile shortcut — POST your own CIDR:
+
+  TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/token \
+    -d "username=analyst&password=analyst123" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+  curl -s -X POST http://localhost:8000/api/v1/scans \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"targets":["10.0.0.0/24"],"profile":"home","authorized":true}' \
+    | python3 -m json.tool
+
+Useful GETs (same TOKEN):
+
+  curl -s -H "Authorization: Bearer $TOKEN" \
+    http://localhost:8000/api/v1/assets | python3 -m json.tool
+
+  curl -s -H "Authorization: Bearer $TOKEN" \
+    "http://localhost:8000/api/v1/vulnerabilities?limit=10" | python3 -m json.tool
+
+  curl -s -H "Authorization: Bearer $TOKEN" \
+    http://localhost:8000/api/v1/metrics/posture | python3 -m json.tool
+
+Mark a finding resolved (copy an "id" from the vulnerabilities list):
+
+  curl -s -X PATCH \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"status":"RESOLVED"}' \
+    http://localhost:8000/api/v1/vulnerabilities/<FINDING_ID> | python3 -m json.tool
+
+After that, posture.mttr_days can become a number instead of null.
+
+
+6. Real LAN scan — will Docker even see your house?
+---------------------------------------------------
+
+nmap and Nuclei run inside the "worker" container, not on your laptop.
+
+  make scan-lan     targets 192.168.1.0/24 by default
+
+If that job COMPLETED with hosts_found=0, the scanner worked, but the
+container could not talk to those addresses. Typical reasons:
+
+  - Your LAN is not 192.168.1.0/24 (check your OS: ipconfig / ip addr)
+  - Docker Desktop (Mac/Windows) NAT cannot reach the LAN the way a
+    native Linux host can
+  - The worker is on a compose bridge (often 172.18.0.0/16)
+
+What to do:
+
+  6a. Scan the CIDR your computer actually uses.
+      Example: if your IP is 192.168.0.14, scan 192.168.0.0/24.
+
+  6b. On Linux, you can attach the worker to the host network so nmap
+      sees the same LAN as your PC. Stop the stack, then in
+      docker-compose.yml under the worker service add:
+
+        network_mode: host
+
+      That is Linux-only. Restart, then scan your real /24 again.
+
+  6c. Lab proof without a LAN: scan the Compose network itself.
+      It is usually inside 172.16.0.0/12 (already allowlisted).
+
+        docker network ls
+        docker network inspect <project>_default
+
+      Look for "Subnet": "172.18.0.0/16" or similar. Then scan that CIDR
+      with authorized true (home profile). You should see at least the
+      API, Postgres, Redis, and maybe the dashboard as live hosts, with
+      ports such as 8000, 5432, 6379, 8501. Hygiene findings may flag
+      databases bound on the network. That proves nmap + inventory +
+      Nuclei against real listeners.
+
+  6d. 127.0.0.1 is allowed, but it is the worker container's loopback,
+      not your laptop. Expect few or no interesting ports.
+
+
+7. Confirm the safety gates work
+--------------------------------
+
+These should FAIL. If they succeed, something is wrong.
+
+  TOKEN=...  (same as above)
+
+  # Missing / false authorization -> HTTP 400
+  curl -s -o /tmp/out.txt -w "%{http_code}\n" -X POST \
+    http://localhost:8000/api/v1/scans \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"targets":["192.168.1.0/24"],"authorized":false}'
+  cat /tmp/out.txt
+
+  # Public IP with no extra allowlist -> HTTP 400
+  curl -s -X POST http://localhost:8000/api/v1/scans \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"targets":["8.8.8.8"],"authorized":true}' | python3 -m json.tool
+
+  # Read-only user cannot launch a scan -> HTTP 403
+  VTOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/token \
+    -d "username=viewer&password=viewer123" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+  curl -s -X POST http://localhost:8000/api/v1/scans \
+    -H "Authorization: Bearer $VTOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"targets":["192.168.1.0/24"],"authorized":true}' | python3 -m json.tool
+
+Expected error.type values: bad_request or permission_denied.
+
+
+8. Automated tests (no Docker required)
+---------------------------------------
+
+These do not send packets. They prove parsing, allowlisting, scoring, and
+the API using fixtures and a temporary SQLite database.
+
+From vuln_aggregator, with Python 3.12+:
+
+  python -m venv .venv
+  source .venv/bin/activate          # Windows: .venv\Scripts\activate
+  pip install -e ".[dev]"
+  pytest src/tests/ -q
+
+You want all tests passed (currently 56).
+
+Or:  make test
+
+If pytest fails, the app is not safe to trust yet — fix that before a live
+scan.
+
+
+9. How to read the results
+--------------------------
+
+Hosts (GET /assets or dashboard Hosts tab)
+
+  ip, hostname, open ports/services, criticality
+  Addresses ending in .1 or .254 are treated as likely gateways (HIGH).
+  risky_service_count is hosts with Telnet, FTP, SMB, RDP, etc.
+
+Findings (GET /vulnerabilities)
+
+  risk_score     0–10. Work down from the top. Treat >= 7 as urgent.
+  is_known_exploited   true means CISA KEV — treat as an emergency.
+  scanner        nmap (hygiene), nuclei, or trivy
+  status         OPEN or RESOLVED
+
+Posture (GET /metrics/posture)
+
+  hosts up, open findings, KEV count, exposure_score, MTTR once you
+  mark items resolved.
+
+A COMPLETED job with hosts_found=0 and findings_so_far=0 can still be a
+success: nothing was listening (or the worker could not reach the range).
+Check worker logs if you expected devices:
+
+  docker compose logs worker | tail -n 80
+
+
+10. What this will not do
+-------------------------
+
+  - No Metasploit, password spray, fuzzing, or exploit payloads
+  - No UDP flood, no OS fingerprinting
+  - Nuclei skips tags: intrusive, dos, fuzz
+  - Greenbone / Nessus are not in Compose; they are skipped unless you
+    configure them (GVM_ENABLED=true, Nessus API keys)
+  - Scheduled scans are off until you set SCAN_TARGETS in .env to a
+    private CIDR you own
+
+
+11. Stop / reset
+----------------
+
+  docker compose down           stop, keep database
+  docker compose down -v        stop and wipe all scan data
+  make clean                    same wipe
+
+
+12. Checklist
+-------------
+
+  [ ] docker compose up --build
+  [ ] curl http://localhost:8000/health  -> {"status":"ok"}
+  [ ] pytest src/tests/ -q               -> all passed
+  [ ] make scan-nginx                    -> job COMPLETED, findings > 0
+  [ ] dashboard login analyst / analyst123, Findings tab shows rows
+  [ ] unauthorized / 8.8.8.8             -> HTTP 400
+  [ ] viewer cannot POST /scans          -> HTTP 403
+  [ ] LAN or compose-network scan        -> Hosts tab lists IPs/ports
+      (if LAN is empty, see section 6)
+
+If the nginx scan completes with findings, the product works. If a LAN scan
+is empty, fix reachability (right CIDR, host networking on Linux) and scan
+again — do not assume nmap is broken.
