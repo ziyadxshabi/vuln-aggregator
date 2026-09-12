@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.models.enums import ScanStatus, Severity
+from src.models.asset import Asset, DiscoveredPort
+from src.models.enums import FindingStatus, ScanProfile, ScanStatus, Severity
 from src.models.posture import PostureMetrics
 from src.models.scan import ScanJob
 from src.models.vulnerability import NormalizedVulnerability
@@ -22,7 +24,15 @@ class ScanRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     targets: list[str] = Field(min_length=1, description="IPs, hostnames, CIDRs, or image refs")
-    scanners: list[str] = Field(default_factory=lambda: ["gvm", "nessus", "trivy"])
+    scanners: list[str] | None = Field(
+        default=None,
+        description="Optional scanner override. Omit to auto-select nmap+nuclei or trivy.",
+    )
+    profile: ScanProfile = Field(default=ScanProfile.HOME)
+    authorized: bool = Field(
+        default=False,
+        description="Must be true: you own or have written permission to scan these targets",
+    )
 
 
 class ScanJobResponse(BaseModel):
@@ -32,6 +42,9 @@ class ScanJobResponse(BaseModel):
     status: ScanStatus
     targets: list[str]
     scanners: list[str]
+    profile: str = "home"
+    requested_by: str | None = None
+    progress: dict[str, Any] = Field(default_factory=dict)
     total_findings: int
     error: str | None
     created_at: datetime
@@ -45,6 +58,9 @@ class ScanJobResponse(BaseModel):
             status=job.status,
             targets=job.targets,
             scanners=job.scanners,
+            profile=job.profile,
+            requested_by=job.requested_by,
+            progress=job.progress,
             total_findings=job.total_findings,
             error=job.error,
             created_at=job.created_at,
@@ -78,6 +94,7 @@ class VulnerabilityResponse(BaseModel):
     enrichment_sources: list[str]
     risk_score: float
     risk_tier: Severity
+    status: FindingStatus = FindingStatus.OPEN
 
     @classmethod
     def from_domain(cls, vuln: NormalizedVulnerability) -> VulnerabilityResponse:
@@ -106,6 +123,7 @@ class VulnerabilityResponse(BaseModel):
             enrichment_sources=vuln.enrichment_sources,
             risk_score=vuln.risk_score,
             risk_tier=vuln.risk_tier,
+            status=vuln.status,
         )
 
 
@@ -114,6 +132,62 @@ class VulnerabilityListResponse(BaseModel):
     count: int
     next_cursor: str | None = None
     has_more: bool = False
+
+
+class FindingStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: FindingStatus
+
+
+class PortResponse(BaseModel):
+    port: int
+    protocol: str
+    service: str | None = None
+    product: str | None = None
+    version: str | None = None
+
+    @classmethod
+    def from_domain(cls, port: DiscoveredPort) -> PortResponse:
+        return cls(
+            port=port.port,
+            protocol=port.protocol,
+            service=port.service,
+            product=port.product,
+            version=port.version,
+        )
+
+
+class AssetResponse(BaseModel):
+    ip: str
+    hostname: str | None
+    os_guess: str | None
+    ports: list[PortResponse]
+    services: str
+    criticality: str
+    scan_job_id: str | None = None
+    first_seen: datetime | None = None
+    last_seen: datetime | None = None
+
+    @classmethod
+    def from_domain(cls, asset: Asset) -> AssetResponse:
+        return cls(
+            ip=asset.ip,
+            hostname=asset.hostname,
+            os_guess=asset.os_guess,
+            ports=[PortResponse.from_domain(p) for p in asset.ports],
+            services=asset.service_summary,
+            criticality=asset.criticality.value,
+            scan_job_id=asset.scan_job_id,
+            first_seen=asset.first_seen,
+            last_seen=asset.last_seen,
+        )
+
+
+class AssetListResponse(BaseModel):
+    items: list[AssetResponse]
+    count: int
+    risky_service_count: int = 0
 
 
 class PostureResponse(BaseModel):

@@ -8,7 +8,10 @@ from pathlib import Path
 
 import httpx
 
-from src.models.enums import Severity
+from src.database.base import Database
+from src.database.repository import AssetRepository
+from src.models.asset import Asset, DiscoveredPort
+from src.models.enums import AssetCriticality, Severity
 from src.models.vulnerability import NormalizedVulnerability
 
 _conftest_path = Path(__file__).resolve().parent.parent / "conftest.py"
@@ -143,7 +146,7 @@ async def test_rbac_read_only_cannot_launch_scan(client: httpx.AsyncClient) -> N
     token = await auth_token(client, "viewer", "viewer123")
     resp = await client.post(
         "/api/v1/scans",
-        json={"targets": ["10.0.0.0/24"], "scanners": ["gvm"]},
+        json={"targets": ["10.0.0.0/24"], "authorized": True},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 403
@@ -158,15 +161,108 @@ async def test_analyst_can_launch_scan(
 
     resp = await client.post(
         "/api/v1/scans",
-        json={"targets": ["10.0.0.0/24"], "scanners": ["gvm", "nessus"]},
+        json={"targets": ["10.0.0.0/24"], "authorized": True},
         headers=headers,
     )
     assert resp.status_code == 202
     body = resp.json()
     assert body["status"] == "PENDING"
+    assert body["scanners"] == ["nmap", "nuclei"]
+    assert body["profile"] == "home"
+    assert body["requested_by"] == "analyst"
     assert body["task_id"] == f"task-{body['id']}"
     assert len(dispatcher.calls) == 1
 
     status_resp = await client.get(f"/api/v1/scans/{body['id']}", headers=headers)
     assert status_resp.status_code == 200
     assert status_resp.json()["targets"] == ["10.0.0.0/24"]
+
+
+async def test_scan_requires_authorization(client: httpx.AsyncClient) -> None:
+    token = await auth_token(client, "analyst", "analyst123")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    denied = await client.post(
+        "/api/v1/scans",
+        json={"targets": ["10.0.0.0/24"], "authorized": False},
+        headers=headers,
+    )
+    assert denied.status_code == 400
+    assert denied.json()["error"]["type"] == "bad_request"
+
+    missing = await client.post(
+        "/api/v1/scans",
+        json={"targets": ["10.0.0.0/24"]},
+        headers=headers,
+    )
+    assert missing.status_code == 400
+    assert missing.json()["error"]["type"] == "bad_request"
+
+
+async def test_scan_rejects_public_target(client: httpx.AsyncClient) -> None:
+    token = await auth_token(client, "analyst", "analyst123")
+    resp = await client.post(
+        "/api/v1/scans",
+        json={"targets": ["8.8.8.8"], "authorized": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["type"] == "bad_request"
+
+
+async def test_patch_resolve_finding(client: httpx.AsyncClient, seed: SeedFn) -> None:
+    vulns = _sample_vulns()
+    await seed(vulns)
+    token = await auth_token(client, "analyst", "analyst123")
+    headers = {"Authorization": f"Bearer {token}"}
+    vuln_id = vulns[0].id
+
+    resp = await client.patch(
+        f"/api/v1/vulnerabilities/{vuln_id}",
+        json={"status": "RESOLVED"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "RESOLVED"
+
+    viewer = await auth_token(client, "viewer", "viewer123")
+    denied = await client.patch(
+        f"/api/v1/vulnerabilities/{vuln_id}",
+        json={"status": "OPEN"},
+        headers={"Authorization": f"Bearer {viewer}"},
+    )
+    assert denied.status_code == 403
+
+
+async def test_list_assets_empty(client: httpx.AsyncClient) -> None:
+    token = await auth_token(client, "viewer", "viewer123")
+    resp = await client.get("/api/v1/assets", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["items"] == []
+    assert body["count"] == 0
+
+
+async def test_list_assets_includes_ports(client: httpx.AsyncClient, database: Database) -> None:
+    async with database.session() as session:
+        repo = AssetRepository(session, database.dialect_name)
+        await repo.bulk_upsert(
+            [
+                Asset(
+                    ip="192.168.1.1",
+                    hostname="router.lan",
+                    ports=[DiscoveredPort(port=23, protocol="tcp", service="telnet")],
+                    criticality=AssetCriticality.HIGH,
+                )
+            ],
+            scan_job_id="job-1",
+        )
+
+    token = await auth_token(client, "viewer", "viewer123")
+    resp = await client.get("/api/v1/assets", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 1
+    assert body["risky_service_count"] == 1
+    assert body["items"][0]["ip"] == "192.168.1.1"
+    assert body["items"][0]["ports"][0]["port"] == 23

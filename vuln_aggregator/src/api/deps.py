@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import Settings, get_settings
 from src.database.base import Database
-from src.database.repository import ScanJobRepository, VulnerabilityRepository
+from src.database.repository import AssetRepository, ScanJobRepository, VulnerabilityRepository
 from src.models.ports import TaskDispatcherPort
 from src.services.posture_service import PostureService
 
@@ -47,6 +47,13 @@ def get_job_repo(
     return ScanJobRepository(session)
 
 
+def get_asset_repo(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> AssetRepository:
+    return AssetRepository(session, get_database(request).dialect_name)
+
+
 def get_posture_service(
     vuln_repo: Annotated[VulnerabilityRepository, Depends(get_vuln_repo)],
 ) -> PostureService:
@@ -57,5 +64,6 @@ SettingsDep = Annotated[Settings, Depends(get_app_settings)]
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 VulnRepoDep = Annotated[VulnerabilityRepository, Depends(get_vuln_repo)]
 JobRepoDep = Annotated[ScanJobRepository, Depends(get_job_repo)]
+AssetRepoDep = Annotated[AssetRepository, Depends(get_asset_repo)]
 DispatcherDep = Annotated[TaskDispatcherPort, Depends(get_dispatcher)]
 PostureServiceDep = Annotated[PostureService, Depends(get_posture_service)]

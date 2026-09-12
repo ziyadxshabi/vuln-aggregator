@@ -11,8 +11,9 @@ from sqlalchemy import Select, and_, asc, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database.base import utcnow
-from src.database.orm import ScanJobRow, VulnerabilityRow
-from src.models.enums import FindingStatus, ScanStatus, Severity
+from src.database.orm import AssetRow, ScanJobRow, VulnerabilityRow
+from src.models.asset import Asset, DiscoveredPort
+from src.models.enums import AssetCriticality, FindingStatus, ScanStatus, Severity
 from src.models.posture import PostureMetrics
 from src.models.scan import ScanJob
 from src.models.vulnerability import NormalizedVulnerability
@@ -131,6 +132,16 @@ class VulnerabilityRepository:
         await self._session.execute(stmt)
         await self._session.commit()
         return len(values)
+
+    async def set_status(self, vuln_id: str, status: FindingStatus) -> NormalizedVulnerability | None:
+        """Mark a finding resolved or reopen it. Returns the updated domain object."""
+        row = await self._session.get(VulnerabilityRow, vuln_id)
+        if row is None:
+            return None
+        row.status = status.value
+        row.resolved_at = utcnow() if status is FindingStatus.RESOLVED else None
+        await self._session.commit()
+        return _row_to_domain(row)
 
     async def get(self, vuln_id: str) -> NormalizedVulnerability | None:
         row = await self._session.get(VulnerabilityRow, vuln_id)
@@ -278,13 +289,23 @@ class ScanJobRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def create(self, targets: list[str], scanners: list[str]) -> ScanJob:
+    async def create(
+        self,
+        targets: list[str],
+        scanners: list[str],
+        *,
+        requested_by: str | None = None,
+        profile: str | None = None,
+    ) -> ScanJob:
         now = utcnow()
         row = ScanJobRow(
             id=uuid.uuid4().hex,
             status=ScanStatus.PENDING.value,
             targets=list(targets),
             scanners=list(scanners),
+            profile=profile or "home",
+            requested_by=requested_by,
+            progress={},
             total_findings=0,
             created_at=now,
             updated_at=now,
@@ -315,6 +336,79 @@ class ScanJobRepository:
         if error is not None:
             row.error = error
         await self._session.commit()
+
+    async def set_progress(self, job_id: str, progress: dict[str, Any]) -> None:
+        row = await self._session.get(ScanJobRow, job_id)
+        if row is None:
+            return
+        row.progress = dict(progress)
+        row.updated_at = utcnow()
+        await self._session.commit()
+
+
+_ASSET_UPDATE_COLUMNS = (
+    "hostname",
+    "os_guess",
+    "ports",
+    "services",
+    "criticality",
+    "scan_job_id",
+    "last_seen",
+)
+
+
+class AssetRepository:
+    """Persistence for discovered hosts."""
+
+    def __init__(self, session: AsyncSession, dialect_name: str) -> None:
+        self._session = session
+        self._dialect = dialect_name
+
+    async def bulk_upsert(self, assets: list[Asset], scan_job_id: str | None = None) -> int:
+        if not assets:
+            return 0
+        now = utcnow()
+        by_ip: dict[str, Asset] = {}
+        for asset in assets:
+            by_ip[asset.ip] = asset
+        values = []
+        for asset in by_ip.values():
+            values.append(
+                {
+                    "ip": asset.ip,
+                    "hostname": asset.hostname,
+                    "os_guess": asset.os_guess,
+                    "ports": [p.model_dump() for p in asset.ports],
+                    "services": asset.service_summary,
+                    "criticality": asset.criticality.value,
+                    "scan_job_id": scan_job_id,
+                    "first_seen": now,
+                    "last_seen": now,
+                }
+            )
+
+        if self._dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+
+        stmt = dialect_insert(AssetRow).values(values)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[AssetRow.ip],
+            set_={col: getattr(stmt.excluded, col) for col in _ASSET_UPDATE_COLUMNS},
+        )
+        await self._session.execute(stmt)
+        await self._session.commit()
+        return len(values)
+
+    async def list(self, *, limit: int = 500) -> list[Asset]:
+        limit = max(1, min(limit, 2000))
+        stmt = select(AssetRow).order_by(AssetRow.ip).limit(limit)
+        rows = list((await self._session.execute(stmt)).scalars().all())
+        return [_asset_to_domain(row) for row in rows]
+
+    async def count(self) -> int:
+        return int((await self._session.execute(select(func.count()).select_from(AssetRow))).scalar_one())
 
 
 def _mean_days(seconds_values: list[float]) -> float | None:
@@ -358,8 +452,28 @@ def _job_to_domain(row: ScanJobRow) -> ScanJob:
         status=ScanStatus(row.status),
         targets=list(row.targets or []),
         scanners=list(row.scanners or []),
+        profile=row.profile or "home",
+        requested_by=row.requested_by,
+        progress=dict(row.progress or {}),
         total_findings=row.total_findings,
         error=row.error,
         created_at=row.created_at,
         updated_at=row.updated_at,
+    )
+
+
+def _asset_to_domain(row: AssetRow) -> Asset:
+    ports: list[DiscoveredPort] = []
+    for item in row.ports or []:
+        if isinstance(item, dict):
+            ports.append(DiscoveredPort.model_validate(item))
+    return Asset(
+        ip=row.ip,
+        hostname=row.hostname,
+        os_guess=row.os_guess,
+        ports=ports,
+        criticality=AssetCriticality(row.criticality),
+        scan_job_id=row.scan_job_id,
+        first_seen=row.first_seen,
+        last_seen=row.last_seen,
     )
