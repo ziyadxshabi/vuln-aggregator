@@ -46,7 +46,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     configure_logging(json_logs=resolved.log_json)
 
     app = FastAPI(
-        title="Enterprise Vulnerability Aggregation & Prioritization Platform",
+        title="Defensive Network Vulnerability Assessment Platform",
         version="1.0.0",
         lifespan=lifespan,
     )

@@ -1,109 +1,108 @@
-# Enterprise Vulnerability Aggregation & Prioritization Platform
+# Defensive Network Vulnerability Assessment Platform
 
-A production-oriented vulnerability management and threat-intelligence platform
-built with **Clean / Hexagonal Architecture** (Ports & Adapters). It ingests
-findings from multiple scanners, normalizes them into a single domain model,
-enriches them with multi-feed threat intelligence, computes a deterministic
-risk score, and exposes a secured REST API.
+Detection-only scanner for networks you own or have written permission to test.
+It discovers live hosts with **nmap**, checks them with **Nuclei** (no exploit
+payloads), optionally scans container images with **Trivy**, then ranks findings
+with CISA KEV / FIRST EPSS / NVD.
 
-## Architecture
+GVM and Nessus connectors remain as optional add-ons; they are **not** started
+by Docker Compose and are skipped unless configured.
 
-```
-              driving adapter                         driven adapters
-            ┌────────────────┐                    ┌─────────────────────┐
-HTTP  ───▶  │  FastAPI (api) │ ──┐            ┌──▶ │ connectors (GVM,    │
-            │  JWT + RBAC    │   │            │    │  Nessus, Trivy)     │
-            └────────────────┘   │            │    ├─────────────────────┤
-                                 ▼            │    │ enrichment (KEV,    │
-   ┌──────────────────────────────────────┐  │    │  EPSS, NVD/Vulners) │
-   │        services (use cases)           │──┤    ├─────────────────────┤
-   │  ScanService · PostureService         │  │    │ database (SQLAlchemy│
-   └──────────────────────────────────────┘  │    │  2.0 async upsert)  │
-                     │                        │    ├─────────────────────┤
-                     ▼ depends only on ports  └──▶ │ workers (Celery)    │
-   ┌──────────────────────────────────────┐       └─────────────────────┘
-   │   models (domain) + engine (risk)     │   pure, framework-agnostic core
-   └──────────────────────────────────────┘
-```
+## What a scan does
 
-- **`src/models/`** — domain models, enums, and the `Protocol` **ports**.
-- **`src/engine/risk_engine.py`** — pure, deterministic scoring (no I/O).
-- **`src/connectors/`** — `BaseScannerConnector` + GVM, Nessus, Trivy adapters.
-- **`src/enrichment/`** — CISA KEV, FIRST EPSS, NVD/Vulners, Redis TTL cache.
-- **`src/database/`** — async engine, ORM (compound indexes), upsert repository.
-- **`src/services/`** — orchestration use cases wired via `factory.py`.
-- **`src/workers/`** — Celery app, tasks, and the task dispatcher.
-- **`src/api/`** — FastAPI app, DI, JWT/RBAC, error envelopes, v1 routes.
+1. Require `authorized: true` and an allowlisted target (RFC1918/loopback by default).
+2. Classify targets: CIDR/IP/hostname → network; `nginx:1.19` → image.
+3. nmap TCP-connect (`-sT -sV`) → host inventory + hygiene findings (Telnet, SMB, …).
+4. Nuclei detection templates (excludes `intrusive`, `dos`, `fuzz`).
+5. Enrich CVEs, score 0–10, upsert into Postgres.
 
-## Requirements
-
-- Python 3.12+
-- PostgreSQL 16+, Redis 7+
-- (Optional) `python-gvm` for live GVM scans, `trivy` binary, OTLP collector
+Profiles: **home** (≤256 hosts), **thorough** (≤1024, includes default-login templates),
+**large** (≤4096, `/24` chunks).
 
 ## Quick start (Docker)
 
 ```bash
-cp .env.example .env          # then edit secrets
+cp .env.example .env
 docker compose up --build
 ```
 
-- API + Swagger UI: `http://localhost:8000/docs`
+- API + Swagger: `http://localhost:8000/docs`
+- Dashboard: `http://localhost:8501` (analyst / analyst123)
 - Health: `http://localhost:8000/health`
-- The `api` service runs `alembic upgrade head` before serving.
-- `worker` runs Celery scan tasks; `beat` schedules KEV refresh + estate scans.
 
-## Local development
+First **image** scan:
 
 ```bash
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
-pytest                       # run the test suite
-mypy src                     # strict type checking
-ruff check src               # lint
+make scan-nginx
+```
+
+First **LAN** scan (private CIDR you own):
+
+```bash
+make scan-lan
+```
+
+Or POST:
+
+```json
+{
+  "targets": ["192.168.1.0/24"],
+  "profile": "home",
+  "authorized": true
+}
 ```
 
 ## Authentication
-
-Obtain a bearer token (seed users come from `AUTH_USERS`):
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/auth/token \
   -d "username=analyst&password=analyst123"
 ```
 
-Use the returned `access_token` as `Authorization: Bearer <token>`.
-
-RBAC tiers: **ADMIN** (all), **ANALYST** (launch scans + read), **READ_ONLY** (read).
+RBAC: **ADMIN** (all), **ANALYST** (launch scans, resolve findings), **READ_ONLY** (read).
 
 ## API (v1)
 
 | Method | Path | Role | Purpose |
 | ------ | ---- | ---- | ------- |
 | POST | `/api/v1/auth/token` | public | Issue a JWT |
-| POST | `/api/v1/scans` | Analyst+ | Launch async scan (returns task id) |
-| GET | `/api/v1/scans/{task_id}` | Read-only+ | Scan progress/status |
-| GET | `/api/v1/vulnerabilities` | Read-only+ | Filter/sort with cursor pagination |
-| GET | `/api/v1/vulnerabilities/{id}` | Read-only+ | Full finding detail |
-| GET | `/api/v1/metrics/posture` | Read-only+ | Posture metrics (severity, KEV, MTTR) |
+| POST | `/api/v1/scans` | Analyst+ | Launch async scan (`authorized` required) |
+| GET | `/api/v1/scans/{id}` | Read-only+ | Status + progress |
+| GET | `/api/v1/assets` | Read-only+ | Discovered hosts and ports |
+| GET | `/api/v1/vulnerabilities` | Read-only+ | Ranked findings |
+| PATCH | `/api/v1/vulnerabilities/{id}` | Analyst+ | Mark resolved |
+| GET | `/api/v1/metrics/posture` | Read-only+ | Exposure / KEV / MTTR |
+
+## Ethics
+
+- Default allowlist: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`.
+- Public IPs/CIDRs are rejected unless added to `SCAN_ALLOWLIST`.
+- nmap does not use OS detection or UDP floods.
+- Nuclei does not run exploit, DoS, or fuzz templates.
+
+## Architecture
+
+```
+HTTP  →  FastAPI (JWT + RBAC)
+           → ScanService
+                → nmap → assets + hygiene
+                → nuclei → CVE/misconfig/TLS/HTTP detections
+                → trivy  → image CVEs
+           → KEV / EPSS / NVD
+           → risk engine → Postgres
+Dashboard and /docs read the same API.
+```
+
+## Local development
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+pytest
+```
 
 ## Risk model
 
-`risk = clamp( (0.40·CVSS) + (0.30·EPSS·10) + (0.15·exploit) [+ KEV boost/floor] ) · asset_multiplier`
+`risk = clamp( (0.40·CVSS) + (0.30·EPSS·10) + (0.15·exploit) [+ KEV] ) · asset_multiplier`
 
-CISA KEV membership applies a fixed boost and forces at least the Critical band.
-The full component breakdown is returned by the engine for auditability.
-
-## Migrations
-
-```bash
-alembic upgrade head          # apply
-alembic revision -m "msg"     # create a new revision (async env)
-```
-
-## Notes
-
-- The deterministic finding `id` is a SHA-256 fingerprint of
-  `scanner + scanner_vuln_id + asset_ip + port + protocol`, enabling idempotent
-  `INSERT ... ON CONFLICT DO UPDATE` upserts across recurring scans.
-- The repository upsert is dialect-aware (PostgreSQL in prod, SQLite in tests).
+Gateway-like addresses (`*.1`, `*.254`) use a HIGH asset multiplier automatically.

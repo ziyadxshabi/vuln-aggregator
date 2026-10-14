@@ -30,10 +30,17 @@ class FakeDispatcher:
     """In-memory task dispatcher used instead of Celery in tests."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, list[str], list[str]]] = []
+        self.calls: list[tuple[str, list[str], list[str], str, str | None]] = []
 
-    def dispatch_scan(self, job_id: str, targets: list[str], scanners: list[str]) -> str:
-        self.calls.append((job_id, targets, scanners))
+    def dispatch_scan(
+        self,
+        job_id: str,
+        targets: list[str],
+        scanners: list[str],
+        profile: str = "home",
+        requested_by: str | None = None,
+    ) -> str:
+        self.calls.append((job_id, targets, scanners, profile, requested_by))
         return f"task-{job_id}"
 
 

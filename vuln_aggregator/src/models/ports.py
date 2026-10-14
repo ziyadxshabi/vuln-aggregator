@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
+from src.models.asset import Asset
 from src.models.enrichment import EnrichmentData
-from src.models.enums import ScanStatus, Severity
+from src.models.enums import FindingStatus, ScanStatus, Severity
 from src.models.posture import PostureMetrics
 from src.models.scan import ScanJob
 from src.models.vulnerability import NormalizedVulnerability
@@ -44,6 +45,10 @@ class VulnerabilityRepositoryPort(Protocol):
 
     async def get(self, vuln_id: str) -> NormalizedVulnerability | None: ...
 
+    async def set_status(
+        self, vuln_id: str, status: FindingStatus
+    ) -> NormalizedVulnerability | None: ...
+
     async def list(
         self,
         *,
@@ -63,7 +68,14 @@ class VulnerabilityRepositoryPort(Protocol):
 class ScanJobRepositoryPort(Protocol):
     """Persistence port for aggregated scan jobs."""
 
-    async def create(self, targets: list[str], scanners: list[str]) -> ScanJob: ...
+    async def create(
+        self,
+        targets: list[str],
+        scanners: list[str],
+        *,
+        requested_by: str | None = None,
+        profile: str | None = None,
+    ) -> ScanJob: ...
 
     async def get(self, job_id: str) -> ScanJob | None: ...
 
@@ -76,9 +88,29 @@ class ScanJobRepositoryPort(Protocol):
         error: str | None = None,
     ) -> None: ...
 
+    async def set_progress(self, job_id: str, progress: dict[str, Any]) -> None: ...
+
+
+@runtime_checkable
+class AssetRepositoryPort(Protocol):
+    """Persistence port for discovered hosts."""
+
+    async def bulk_upsert(self, assets: list[Asset], scan_job_id: str | None = None) -> int: ...
+
+    async def list(self, *, limit: int = 500) -> list[Asset]: ...
+
+    async def count(self) -> int: ...
+
 
 @runtime_checkable
 class TaskDispatcherPort(Protocol):
     """Dispatches long-running scan work to a background worker pool."""
 
-    def dispatch_scan(self, job_id: str, targets: list[str], scanners: list[str]) -> str: ...
+    def dispatch_scan(
+        self,
+        job_id: str,
+        targets: list[str],
+        scanners: list[str],
+        profile: str = "home",
+        requested_by: str | None = None,
+    ) -> str: ...

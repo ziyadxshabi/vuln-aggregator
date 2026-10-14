@@ -9,9 +9,9 @@ from fastapi import APIRouter, Depends, Query, Request
 from src.api.deps import VulnRepoDep
 from src.api.errors import NotFoundError
 from src.api.rate_limit import limiter
-from src.api.schemas import VulnerabilityListResponse, VulnerabilityResponse
-from src.api.security import AuthUser, get_current_user
-from src.models.enums import Severity
+from src.api.schemas import FindingStatusUpdate, VulnerabilityListResponse, VulnerabilityResponse
+from src.api.security import AuthUser, get_current_user, require_roles
+from src.models.enums import Role, Severity
 
 router = APIRouter(prefix="/vulnerabilities", tags=["vulnerabilities"])
 
@@ -59,6 +59,22 @@ async def get_vulnerability(
 ) -> VulnerabilityResponse:
     """Return full detail, enrichment sources, and remediation for one finding."""
     vuln = await vuln_repo.get(vuln_id)
+    if vuln is None:
+        raise NotFoundError(f"Vulnerability {vuln_id!r} not found")
+    return VulnerabilityResponse.from_domain(vuln)
+
+
+@router.patch("/{vuln_id}", response_model=VulnerabilityResponse)
+@limiter.limit("120/minute")
+async def update_vulnerability_status(
+    request: Request,
+    vuln_id: str,
+    payload: FindingStatusUpdate,
+    vuln_repo: VulnRepoDep,
+    _user: Annotated[AuthUser, Depends(require_roles(Role.ANALYST))],
+) -> VulnerabilityResponse:
+    """Mark a finding resolved (or reopen it) so MTTR can be measured."""
+    vuln = await vuln_repo.set_status(vuln_id, payload.status)
     if vuln is None:
         raise NotFoundError(f"Vulnerability {vuln_id!r} not found")
     return VulnerabilityResponse.from_domain(vuln)

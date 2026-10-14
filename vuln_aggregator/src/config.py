@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     gvm_username: str = Field(default="admin")
     gvm_password: str = Field(default="admin")
     gvm_use_tls: bool = Field(default=True)
+    gvm_enabled: bool = Field(default=False)
 
     nessus_url: str = Field(default="https://nessus:8834")
     nessus_access_key: str = Field(default="")
@@ -65,6 +66,8 @@ class Settings(BaseSettings):
     nessus_verify_tls: bool = Field(default=False)
 
     trivy_binary: str = Field(default="trivy")
+    nmap_binary: str = Field(default="nmap")
+    nuclei_binary: str = Field(default="nuclei")
 
     # --- Threat intelligence feeds --------------------------------------
     cisa_kev_url: str = Field(
@@ -84,15 +87,25 @@ class Settings(BaseSettings):
     scan_poll_timeout_seconds: float = Field(default=7_200.0)
     scan_schedule_hours: int = Field(default=6)
     scan_targets: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    scan_allowlist: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "127.0.0.0/8",
+            "::1/128",
+        ]
+    )
+    scan_profile: str = Field(default="home")
 
     # --- HTTP resilience -------------------------------------------------
     http_timeout_seconds: float = Field(default=30.0)
     http_max_retries: int = Field(default=4)
 
-    @field_validator("scan_targets", mode="before")
+    @field_validator("scan_targets", "scan_allowlist", mode="before")
     @classmethod
     def _split_targets(cls, value: object) -> object:
-        """Allow ``SCAN_TARGETS`` to be a comma-separated string."""
+        """Allow comma-separated strings for target/allowlist lists."""
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value

@@ -85,9 +85,32 @@ class ScanJobRow(Base):
     status: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
     targets: Mapped[list[str]] = mapped_column(JSONVariant, default=list)
     scanners: Mapped[list[str]] = mapped_column(JSONVariant, default=list)
+    profile: Mapped[str] = mapped_column(String(16), default="home")
+    requested_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    progress: Mapped[dict[str, object]] = mapped_column(JSONVariant, default=dict)
     total_findings: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class AssetRow(Base):
+    """Persistent host inventory from network discovery."""
+
+    __tablename__ = "assets"
+
+    ip: Mapped[str] = mapped_column(String(64), primary_key=True)
+    hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    os_guess: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ports: Mapped[list[object]] = mapped_column(JSONVariant, default=list)
+    services: Mapped[str] = mapped_column(Text, default="")
+    criticality: Mapped[str] = mapped_column(String(16), default="MEDIUM", index=True)
+    scan_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    __table_args__ = (Index("ix_assets_hostname", "hostname"),)
